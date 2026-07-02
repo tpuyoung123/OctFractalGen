@@ -32,17 +32,42 @@ from utils.utils import octree2seq
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
+def strip_octree_runtime_fields(octree):
+    """Remove runtime-only tensors before writing an octree to disk cache."""
+    if hasattr(octree, "neighs") and octree.neighs is not None:
+        octree.neighs = [None for _ in octree.neighs]
+    return octree
+
+
+def octree_has_runtime_fields(octree):
+    return any(x is not None for x in getattr(octree, "neighs", []) or [])
+
+
+def ensure_octree_neighs(octree, full_depth=3, depth=8):
+    for d in range(full_depth, depth + 1):
+        if octree.neighs[d] is None:
+            octree.construct_neigh(d)
+    return octree
+
+
 class ShapeNetOctreeDataset(Dataset):
     """Loads .npz point clouds and builds octrees for OctFractalGen training."""
 
     def __init__(
-        self, data_dir, depth=8, full_depth=3, points_scale=1.0, cache_dir=None
+        self,
+        data_dir,
+        depth=8,
+        full_depth=3,
+        points_scale=1.0,
+        cache_dir=None,
+        compact_cache_on_load=True,
     ):
         self.data_dir = data_dir
         self.depth = depth
         self.full_depth = full_depth
         self.points_scale = points_scale
         self.cache_dir = cache_dir
+        self.compact_cache_on_load = compact_cache_on_load
 
         self.files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
         if len(self.files) == 0:
@@ -70,9 +95,6 @@ class ShapeNetOctreeDataset(Dataset):
         pts.clip(-1.0, 1.0)
         octree = Octree(depth=self.depth, full_depth=self.full_depth)
         octree.build_octree(pts)
-        # build_octree uses update_neigh=False; construct neighs for conv ops
-        for d in range(self.full_depth, self.depth + 1):
-            octree.construct_neigh(d)
         return octree
 
     def __getitem__(self, idx):
@@ -81,6 +103,9 @@ class ShapeNetOctreeDataset(Dataset):
         if cache_path and os.path.exists(cache_path):
             try:
                 octree = torch.load(cache_path, weights_only=False)
+                if self.compact_cache_on_load and octree_has_runtime_fields(octree):
+                    strip_octree_runtime_fields(octree)
+                    torch.save(octree, cache_path)
                 return octree
             except Exception:
                 pass  # cache corrupt, rebuild
@@ -90,6 +115,7 @@ class ShapeNetOctreeDataset(Dataset):
         # save cache
         if cache_path:
             try:
+                strip_octree_runtime_fields(octree)
                 torch.save(octree, cache_path)
             except Exception:
                 pass
@@ -109,13 +135,11 @@ def merge_octree_batch(octrees, full_depth=3, depth=8):
     when run inside DataLoader worker processes on Windows.
     """
     if len(octrees) == 1:
-        return octrees[0]
+        return ensure_octree_neighs(octrees[0], full_depth, depth)
     batched = Octree.init_like(octrees[0])
     batched.merge_octrees(octrees)
     # merge_octrees does not carry over neighs; rebuild for conv ops
-    for d in range(full_depth, depth + 1):
-        batched.construct_neigh(d)
-    return batched
+    return ensure_octree_neighs(batched, full_depth, depth)
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +419,22 @@ def main():
     parser.add_argument("--depth", type=int, default=8)
     parser.add_argument("--full_depth", type=int, default=3)
     parser.add_argument(
-        "--cache", action="store_true", default=True, help="Cache built octrees to disk"
+        "--cache",
+        action="store_true",
+        default=False,
+        help="Cache compact octrees to disk. Disabled by default to avoid large log dirs.",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="Directory for compact octree cache. Defaults to <logdir>/octree_cache when --cache is set.",
+    )
+    parser.add_argument(
+        "--no_compact_cache_on_load",
+        action="store_true",
+        default=False,
+        help="Do not rewrite old cached octrees after stripping runtime fields.",
     )
     parser.add_argument("--no_amp", action="store_true", default=False)
     parser.add_argument("--resume", type=str, default=None)
@@ -491,9 +530,15 @@ def main():
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     # ---- Dataset ----
-    cache_dir = os.path.join(args.logdir, "octree_cache") if args.cache else None
+    cache_dir = None
+    if args.cache:
+        cache_dir = args.cache_dir or os.path.join(args.logdir, "octree_cache")
     dataset = ShapeNetOctreeDataset(
-        args.data_dir, depth=args.depth, full_depth=args.full_depth, cache_dir=cache_dir
+        args.data_dir,
+        depth=args.depth,
+        full_depth=args.full_depth,
+        cache_dir=cache_dir,
+        compact_cache_on_load=not args.no_compact_cache_on_load,
     )
     dataloader = DataLoader(
         dataset,
