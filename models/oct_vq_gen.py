@@ -35,6 +35,9 @@ class OctVQGenerator(nn.Module):
                  vq_groups=32, num_iters=256, generator_type="mar",
                  patch_size=1024, dilation=2, use_swin=True, use_checkpoint=True,
                  attn_dropout=0.0, proj_dropout=0.1,
+                 mask_ratio_min=0.5, random_flip=0.1,
+                 remask_stage=0.7, remask_prob=0.1,
+                 loss_weight=1.0, denoise_weight=0.3,
                  full_depth=3, max_depth=8):
         super().__init__()
         self.depth = depth                 # terminal depth, e.g. 6
@@ -45,9 +48,14 @@ class OctVQGenerator(nn.Module):
         self.patch_size = patch_size
         self.dilation = dilation
         self.use_swin = use_swin
+        self.random_flip = random_flip
+        self.remask_stage = remask_stage
+        self.remask_prob = remask_prob
+        self.loss_weight = loss_weight
+        self.denoise_weight = denoise_weight
 
-        # VQ code projection: BSQ32 (32-dim binary) -> embedding
-        # Revealed positions use this; equivalent to OctGPT's vq_proj on zq.
+        # VQ code projection: BSQ32 quantized code zq -> embedding.
+        # For BSQ, zq is (-1/+1) / sqrt(32), matching OctGPT.
         self.vq_proj = nn.Linear(vq_groups, embed_dim)
 
         # condition projection: parent features -> current embed_dim (bias)
@@ -69,8 +77,9 @@ class OctVQGenerator(nn.Module):
         # output shape: (N, 2 * vq_groups) -> reshape to (N, vq_groups, 2)
         self.vq_head = nn.Linear(embed_dim, 2 * vq_groups)
 
-        # MAR masking ratio distribution
-        self.mask_ratio_generator = stats.truncnorm(-4, 0, loc=1.0, scale=0.25)
+        # MAR masking ratio distribution, matching OctGPT's high-mask training.
+        self.mask_ratio_generator = stats.truncnorm(
+            (mask_ratio_min - 1.0) / 0.25, 0, loc=1.0, scale=0.25)
 
         self._init_weights()
 
@@ -88,6 +97,33 @@ class OctVQGenerator(nn.Module):
                     nn.init.constant_(m.weight, 1.0)
 
     # ------------------------------------------------------------------
+    # BSQ / remask helpers
+    # ------------------------------------------------------------------
+    def _bsq_indices_to_code(self, indices):
+        return (indices.float() * 2.0 - 1.0) * (1.0 / self.vq_groups ** 0.5)
+
+    def _get_correct_topk(self, logits, targets, topk=1):
+        topk = min(topk, logits.shape[-1] - 1)
+        topk = torch.topk(logits, topk, dim=-1).indices
+        return topk.eq(targets.unsqueeze(-1).expand_as(topk))
+
+    def _get_remask(self, logits, tokens, mask, remask_prob=0.1, topk=5):
+        correct_topk = self._get_correct_topk(logits, tokens, topk=topk)
+        correct_by_group = correct_topk.any(dim=-1)
+        num_incorrect = (~correct_by_group).sum(dim=-1)
+        num_incorrect[mask] = 0
+
+        num_remask = int(num_incorrect.bool().sum().item() * remask_prob)
+        remask = torch.zeros_like(mask, dtype=torch.bool)
+        if num_remask <= 0:
+            return remask
+
+        remask_scores = num_incorrect.float()
+        remask_indices = torch.topk(remask_scores, num_remask).indices
+        remask[remask_indices] = True
+        return remask & ~mask
+
+    # ------------------------------------------------------------------
     # shared encoder
     # ------------------------------------------------------------------
     def _encode(self, octree, vq_codes, cond_list, mask=None):
@@ -95,7 +131,7 @@ class OctVQGenerator(nn.Module):
 
         Args:
             octree: octree (GT during training, growing during sampling)
-            vq_codes: (N_d, vq_groups) long in {0, 1}; revealed VQ codes.
+            vq_codes: (N_d, vq_groups) BSQ quantized code zq.
                 Unrevealed positions can be any value (will be overwritten).
             cond_list: [parent_features] with shape (N_d, cond_embed_dim)
             mask: bool tensor (N_d,) True=unrevealed (use mask_token).
@@ -105,10 +141,12 @@ class OctVQGenerator(nn.Module):
         """
         parent_features = cond_list[0]
         cond = self.cond_proj(parent_features)               # (N_d, E) bias
-        x = self.vq_proj(vq_codes.float()) + cond            # (N_d, E) token + cond
+        vq_codes = vq_codes.to(dtype=parent_features.dtype)
+        x = self.vq_proj(vq_codes) + cond                    # (N_d, E) token + cond
 
         if mask is not None:
-            x = torch.where(mask.unsqueeze(1), self.mask_token.to(x.dtype), x)
+            masked_x = self.mask_token.to(x.dtype) + cond
+            x = torch.where(mask.unsqueeze(1), masked_x, x)
 
         # Build OctreeT for windowed attention at this depth
         nnum_d = x.shape[0]
@@ -129,19 +167,32 @@ class OctVQGenerator(nn.Module):
     # training forward (teacher forcing) — called as next_fractal(octree, cond_list, targets)
     # ------------------------------------------------------------------
     def forward(self, octree, cond_list, targets):
-        """Training: compute VQ loss and top5 accuracy.
+        """Training: compute VQ loss and VQ prediction accuracy.
 
         Args:
             octree: GT octree
             cond_list: [parent_features] (N_6, cond_embed_dim)
             targets: dict with 'vq' key -> (N_6, vq_groups) in {0, 1}
         Returns:
-            (vq_loss, metrics_dict): metrics_dict contains 'vq_top5_acc'.
+            (weighted_vq_loss, metrics_dict): metrics_dict contains
+            bit-level and full-code VQ accuracy.
             Note: BSQ32 has vq_size=2 (per-bit binary), so top5 degenerates
             to top1 (topk=min(5, 2-1)=1), consistent with OctGPT.
         """
         nnum_d = octree.nnum[self.depth]
         target_vq = targets['vq']  # (N, 32) in {0, 1}
+        target_vq_code = targets.get('vq_zq')
+        if target_vq_code is None:
+            target_vq_code = self._bsq_indices_to_code(target_vq)
+        target_vq_code = target_vq_code.to(octree.device)
+
+        input_vq = target_vq
+        input_vq_code = target_vq_code
+        use_random_flip = self.training and self.random_flip > 0.0
+        if use_random_flip:
+            flip = torch.rand_like(target_vq.float()) < self.random_flip
+            input_vq = torch.where(flip, 1 - target_vq, target_vq)
+            input_vq_code = self._bsq_indices_to_code(input_vq).to(octree.device)
 
         if self.training and self.generator_type == "mar":
             mask_rate = self.mask_ratio_generator.rvs(1)[0]
@@ -152,27 +203,63 @@ class OctVQGenerator(nn.Module):
         else:
             mask = None
 
-        # teacher forcing: revealed positions use GT VQ code embedding
-        x = self._encode(octree, target_vq, cond_list, mask)
+        # teacher forcing: revealed positions use BSQ zq embedding, as in OctGPT.
+        x = self._encode(octree, input_vq_code, cond_list, mask)
         vq_logits = self.vq_head(x).reshape(-1, self.vq_groups, 2)  # (N, 32, 2)
 
-        if mask is not None:
-            logits_flat = vq_logits[mask].reshape(-1, 2)
-            target_flat = target_vq[mask].reshape(-1)
-            loss = F.cross_entropy(logits_flat, target_flat)
-            # top5 accuracy (bit-level top1, since vq_size=2)
-            with torch.no_grad():
-                vq_pred = logits_flat.argmax(dim=-1)
-                vq_top5_acc = (vq_pred == target_flat).float().mean()
-        else:
+        # Loss computation: focus prediction gradient on masked positions.
+        # When random_flip is active, OctGPT computes loss on ALL tokens
+        # (denoising + prediction). But the small L3 model (120 dim / 2 blocks)
+        # cannot handle both tasks effectively, causing vq_top5_acc to plateau
+        # at ~0.75. Fix: main prediction loss on masked positions only; add a
+        # low-weight denoising loss on flipped non-masked positions so the
+        # model still learns noise robustness without diluting prediction
+        # gradient.
+        if mask is None:
+            # eval / non-MAR: loss on all tokens
             logits_flat = vq_logits.reshape(-1, 2)
             target_flat = target_vq.reshape(-1)
-            loss = F.cross_entropy(logits_flat, target_flat)
-            with torch.no_grad():
-                vq_pred = logits_flat.argmax(dim=-1)
-                vq_top5_acc = (vq_pred == target_flat).float().mean()
+            raw_loss = F.cross_entropy(logits_flat, target_flat)
+            logits_for_metric = vq_logits
+            target_for_metric = target_vq
+        else:
+            # MAR training: prediction loss on masked positions only
+            pred_logits = vq_logits[mask].reshape(-1, 2)
+            pred_target = target_vq[mask].reshape(-1)
+            raw_loss = F.cross_entropy(pred_logits, pred_target)
+            logits_for_metric = vq_logits[mask]
+            target_for_metric = target_vq[mask]
 
-        return loss, {'vq_top5_acc': vq_top5_acc}
+            # low-weight denoising loss on flipped non-masked positions
+            if use_random_flip:
+                revealed = ~mask
+                flipped = revealed & (input_vq != target_vq).any(dim=-1)
+                if flipped.any():
+                    denoise_logits = vq_logits[flipped].reshape(-1, 2)
+                    denoise_target = target_vq[flipped].reshape(-1)
+                    denoise_loss = F.cross_entropy(denoise_logits, denoise_target)
+                    raw_loss = raw_loss + self.denoise_weight * denoise_loss
+
+        loss = raw_loss * self.loss_weight
+
+        with torch.no_grad():
+            vq_pred = logits_for_metric.argmax(dim=-1)
+            vq_bit_acc = (vq_pred == target_for_metric).float().mean()
+            vq_code_acc = (vq_pred == target_for_metric).all(dim=-1).float().mean()
+            vq_mask_ratio = (
+                mask.float().mean()
+                if mask is not None
+                else torch.zeros((), device=octree.device)
+            )
+
+        return loss, {
+            'vq_loss': raw_loss.detach(),
+            'vq_loss_weighted': loss.detach(),
+            'vq_bit_acc': vq_bit_acc,
+            'vq_top5_acc': vq_bit_acc,  # backward-compatible alias
+            'vq_code_acc': vq_code_acc,
+            'vq_mask_ratio': vq_mask_ratio,
+        }
 
     # ------------------------------------------------------------------
     # generation (MAR iterative sampling + VQVAE decode)
@@ -195,17 +282,19 @@ class OctVQGenerator(nn.Module):
         nnum_d = octree.nnum[self.depth]
         device = octree.device
 
-        # start: all masked, vq_pred initialized to 0 (placeholder)
+        # start: all masked, vq_pred/code initialized as placeholders
         mask = torch.ones(nnum_d, dtype=torch.bool, device=device)
         orders = torch.randperm(nnum_d, device=device)
         vq_pred = torch.zeros(nnum_d, self.vq_groups, dtype=torch.long,
+                              device=device)
+        vq_code = torch.zeros(nnum_d, self.vq_groups, dtype=torch.float,
                               device=device)
 
         num_iter = min(num_iter, nnum_d)
 
         for step in range(num_iter):
-            # forward with current mask (revealed=vq_proj, masked=mask_token)
-            x = self._encode(octree, vq_pred, cond_list, mask)
+            # forward with current mask (revealed=BSQ zq, masked=mask_token+cond)
+            x = self._encode(octree, vq_code, cond_list, mask)
             vq_logits = self.vq_head(x).reshape(-1, self.vq_groups, 2)
 
             # cosine schedule: number of masked positions for NEXT step
@@ -223,14 +312,26 @@ class OctVQGenerator(nn.Module):
             else:
                 mask_to_pred = mask ^ mask_next
 
+            mask = mask_next
+
+            # OctGPT-style remask: revisit low-confidence revealed VQ codes.
+            if step > num_iter * self.remask_stage and self.remask_prob > 0.0:
+                remask = self._get_remask(
+                    vq_logits, vq_pred, mask,
+                    topk=5, remask_prob=self.remask_prob)
+                mask_to_pred = mask_to_pred | remask
+
             # sample VQ codes at positions revealed this step
+            cur_temperature = temperature * ((num_iter - step) / num_iter)
+            if not mask_to_pred.any():
+                continue
             sampled = sample(
                 vq_logits[mask_to_pred].reshape(-1, 2),
-                temperature=temperature)
+                temperature=cur_temperature)
             sampled = sampled.reshape(-1, self.vq_groups)
             vq_pred[mask_to_pred] = sampled.long()
-
-            mask = mask_next
+            zq = vqvae.quantizer.extract_code(sampled)
+            vq_code[mask_to_pred] = zq.float()
 
         # ------ Early return: raw octree + VQ codes (skip VQVAE decode) ------
         if return_raw_octree:

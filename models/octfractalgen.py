@@ -1,20 +1,3 @@
-"""OctFractalGen: Fractal Generative Model for Octree-based 3D Generation.
-
-Recursive coarse-to-fine generation on octrees, following the FractalGen
-architecture style. Each fractal level is an independent generator operating
-at a fixed octree depth:
-
-  - Intermediate levels (depth 3, 4, 5): OctSplitGenerator
-      predicts split tokens (0=leaf, 1=split) + features for next level
-  - Terminal level (depth 6): OctVQGenerator
-      predicts VQ codes (BSQ32), decoded by frozen pretrained VQVAE
-
-The parent level's feature output is unpooled to 8 children and used as the
-condition for the next level, forming a fractal recursion from coarse to fine.
-
-Unconditional generation: a learnable root_token replaces the class embedding.
-"""
-
 from functools import partial
 
 import torch
@@ -28,23 +11,31 @@ from models.oct_vq_gen import OctVQGenerator
 class OctFractalGen(nn.Module):
     """Fractal Generative Model for Octree-based 3D Generation."""
 
-    def __init__(self,
-                 depth_list,
-                 embed_dim_list,
-                 num_blocks_list,
-                 num_heads_list,
-                 generator_type_list,
-                 num_iters_list,
-                 vq_groups=32,
-                 full_depth=3,
-                 max_depth=8,
-                 attn_dropout=0.0,
-                 proj_dropout=0.1,
-                 patch_size=1024,
-                 dilation=2,
-                 use_swin=True,
-                 use_checkpoint=True,
-                 fractal_level=0):
+    def __init__(
+        self,
+        depth_list,
+        embed_dim_list,
+        num_blocks_list,
+        num_heads_list,
+        generator_type_list,
+        num_iters_list,
+        vq_groups=32,
+        full_depth=3,
+        max_depth=8,
+        attn_dropout=0.0,
+        proj_dropout=0.1,
+        patch_size=1024,
+        dilation=2,
+        use_swin=True,
+        use_checkpoint=True,
+        vq_mask_ratio_min=0.5,
+        vq_random_flip=0.1,
+        vq_remask_stage=0.7,
+        vq_remask_prob=0.1,
+        vq_loss_weight=1.0,
+        vq_denoise_weight=0.3,
+        fractal_level=0,
+    ):
         super().__init__()
 
         # ----------------------------------------------------------------------
@@ -54,6 +45,7 @@ class OctFractalGen(nn.Module):
         self.max_depth = max_depth
         self.fractal_level = fractal_level
         self.num_fractal_levels = len(depth_list)
+        self.vq_loss_weight = vq_loss_weight
 
         # ----------------------------------------------------------------------
         # Root token for the first fractal level (unconditional generation)
@@ -68,7 +60,9 @@ class OctFractalGen(nn.Module):
         self.generator = OctSplitGenerator(
             depth=depth_list[fractal_level],
             embed_dim=embed_dim_list[fractal_level],
-            cond_embed_dim=embed_dim_list[fractal_level - 1] if fractal_level > 0 else embed_dim_list[0],
+            cond_embed_dim=embed_dim_list[fractal_level - 1]
+            if fractal_level > 0
+            else embed_dim_list[0],
             num_blocks=num_blocks_list[fractal_level],
             num_heads=num_heads_list[fractal_level],
             generator_type=generator_type_list[fractal_level],
@@ -102,6 +96,12 @@ class OctFractalGen(nn.Module):
                 dilation=dilation,
                 use_swin=use_swin,
                 use_checkpoint=use_checkpoint,
+                vq_mask_ratio_min=vq_mask_ratio_min,
+                vq_random_flip=vq_random_flip,
+                vq_remask_stage=vq_remask_stage,
+                vq_remask_prob=vq_remask_prob,
+                vq_loss_weight=vq_loss_weight,
+                vq_denoise_weight=vq_denoise_weight,
                 fractal_level=fractal_level + 1,
             )
         else:
@@ -122,6 +122,12 @@ class OctFractalGen(nn.Module):
                 use_checkpoint=use_checkpoint,
                 attn_dropout=attn_dropout,
                 proj_dropout=proj_dropout,
+                mask_ratio_min=vq_mask_ratio_min,
+                random_flip=vq_random_flip,
+                remask_stage=vq_remask_stage,
+                remask_prob=vq_remask_prob,
+                loss_weight=vq_loss_weight,
+                denoise_weight=vq_denoise_weight,
                 full_depth=full_depth,
                 max_depth=max_depth,
             )
@@ -148,9 +154,10 @@ class OctFractalGen(nn.Module):
         # Generator forward: predict split + features for next level
         # Pass target_split for teacher forcing (revealed positions use GT
         # split embedding, masked positions use mask_token).
-        target_split = targets['split'][self.fractal_level]
+        target_split = targets["split"][self.fractal_level]
         split_logits, cond_list_next, aux_loss = self.generator(
-            octree, cond_list, target_split)
+            octree, cond_list, target_split
+        )
 
         # Split loss + top1 accuracy at current level
         loss = F.cross_entropy(split_logits, target_split)
@@ -161,13 +168,24 @@ class OctFractalGen(nn.Module):
         # Recursive: next level returns (loss, metrics)
         sub_loss, sub_metrics = self.next_fractal(octree, cond_list_next, targets)
 
-        metrics = {f'split_acc_l{self.fractal_level}': split_acc}
+        metrics = {
+            f"split_loss_l{self.fractal_level}": loss.detach(),
+            f"split_acc_l{self.fractal_level}": split_acc,
+        }
         metrics.update(sub_metrics)
         return loss + aux_loss + sub_loss, metrics
 
-    def sample(self, cond_list=None, octree=None, vqvae=None,
-               num_iter_list=None, temperature=1.0, fractal_level=0,
-               visualize=False, return_raw_octree=False):
+    def sample(
+        self,
+        cond_list=None,
+        octree=None,
+        vqvae=None,
+        num_iter_list=None,
+        temperature=1.0,
+        fractal_level=0,
+        visualize=False,
+        return_raw_octree=False,
+    ):
         """
         Generate samples recursively (coarse-to-fine).
 
@@ -204,23 +222,34 @@ class OctFractalGen(nn.Module):
         else:
             # Terminal level: OctVQGenerator.sample -> VQVAE decode -> mesh
             # (or skip decode if return_raw_octree=True)
+            terminal_num_iter = (
+                None if num_iter_list is None else num_iter_list[fractal_level + 1]
+            )
             next_level_sample_function = partial(
                 self.next_fractal.sample,
                 vqvae=vqvae,
+                num_iter=terminal_num_iter,
+                temperature=temperature,
                 return_raw_octree=return_raw_octree,
             )
 
         # Recursively sample using the current generator
         return self.generator.sample(
-            cond_list, octree, num_iter_list[fractal_level],
-            temperature, next_level_sample_function, visualize)
+            cond_list,
+            octree,
+            num_iter_list[fractal_level],
+            temperature,
+            next_level_sample_function,
+            visualize,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Model factory functions (following FractalGen convention)
 # ---------------------------------------------------------------------------
 
-def octfractalgen_shapenet(**kwargs):
+
+def octfractalgen_shapenet_vq120_b2(**kwargs):
     """OctFractalGen for ShapeNet airplane (unconditional, depth 3->6).
 
     4 fractal levels. Embed dims chosen so that (dim // heads) % 6 == 0,
@@ -243,6 +272,148 @@ def octfractalgen_shapenet(**kwargs):
         **kwargs,
     )
     return model
+
+
+def octfractalgen_shapenet_vq240_b4(**kwargs):
+    """ShapeNet variant with a stronger terminal VQ predictor.
+
+    Keeps the coarse split hierarchy unchanged, but increases the depth-6 VQ
+    generator from 120 dim / 2 blocks to 240 dim / 4 blocks. This uses the
+    extra memory headroom to improve BSQ32 prediction without changing the
+    target VQVAE code format.
+    """
+    model = OctFractalGen(
+        depth_list=(3, 4, 5, 6),
+        embed_dim_list=(768, 384, 240, 240),
+        num_blocks_list=(16, 8, 4, 4),
+        num_heads_list=(8, 8, 4, 8),
+        generator_type_list=("mar", "mar", "mar", "mar"),
+        num_iters_list=(64, 128, 128, 256),
+        fractal_level=0,
+        **kwargs,
+    )
+    return model
+
+
+def octfractalgen_shapenet_vq384_b8(**kwargs):
+    """ShapeNet variant with an aggressive terminal VQ predictor.
+
+    L3 (depth=6 VQ generator) is enlarged to 384 dim / 8 blocks (~5.6M params,
+    ~16x larger than the baseline 120 dim / 2 blocks). This is the
+    cost-effective sweet spot for BSQ32 prediction: expected vq_top5_acc
+    ~0.88-0.92, approaching OctGPT's 0.90+ without exploding total params.
+
+    RoPE-compatible: 384 / 8 = 48, 48 % 6 == 0.
+    """
+    model = OctFractalGen(
+        depth_list=(3, 4, 5, 6),
+        embed_dim_list=(768, 384, 240, 384),
+        num_blocks_list=(16, 8, 4, 8),
+        num_heads_list=(8, 8, 4, 8),
+        generator_type_list=("mar", "mar", "mar", "mar"),
+        num_iters_list=(64, 128, 128, 256),
+        fractal_level=0,
+        **kwargs,
+    )
+    return model
+
+
+def octfractalgen_shapenet_vq384_b16(**kwargs):
+    """ShapeNet variant with maximum terminal VQ predictor capacity.
+
+    L3 (depth=6 VQ generator) is enlarged to 384 dim / 16 blocks (~11M params,
+    ~32x larger than the baseline 120 dim / 2 blocks). With this capacity,
+    L3 approaches OctGPT's per-block depth (OctGPT uses 24 blocks total
+    split as 12 enc + 12 dec). Expected vq_top5_acc ~0.92+, matching OctGPT.
+
+    Total params ~144M. RoPE-compatible: 384 / 8 = 48, 48 % 6 == 0.
+    """
+    model = OctFractalGen(
+        depth_list=(3, 4, 5, 6),
+        embed_dim_list=(768, 384, 240, 384),
+        num_blocks_list=(16, 8, 4, 16),
+        num_heads_list=(8, 8, 4, 8),
+        generator_type_list=("mar", "mar", "mar", "mar"),
+        num_iters_list=(64, 128, 128, 256),
+        fractal_level=0,
+        **kwargs,
+    )
+    return model
+
+
+def octfractalgen_shapenet_vq576_b8(**kwargs):
+    """ShapeNet variant with a wider terminal VQ predictor.
+
+    L3 (depth=6 VQ generator) is enlarged to 576 dim / 8 blocks while keeping
+    the coarse split hierarchy unchanged. This is a wider alternative to
+    vq384_b8 for improving BSQ32 bit interactions.
+
+    RoPE-compatible: 576 / 8 = 72, 72 % 6 == 0.
+    """
+    model = OctFractalGen(
+        depth_list=(3, 4, 5, 6),
+        embed_dim_list=(768, 384, 240, 576),
+        num_blocks_list=(16, 8, 4, 8),
+        num_heads_list=(8, 8, 4, 8),
+        generator_type_list=("mar", "mar", "mar", "mar"),
+        num_iters_list=(64, 128, 128, 256),
+        fractal_level=0,
+        **kwargs,
+    )
+    return model
+
+
+def octfractalgen_shapenet_vq576_b12(**kwargs):
+    """Recommended high-capacity ShapeNet terminal VQ predictor.
+
+    L3 (depth=6 VQ generator) is enlarged to 576 dim / 12 blocks. This raises
+    both width and depth over the vq384 variants while staying compatible with
+    the current OctFormer RoPE constraints.
+
+    RoPE-compatible: 576 / 8 = 72, 72 % 6 == 0.
+    """
+    model = OctFractalGen(
+        depth_list=(3, 4, 5, 6),
+        embed_dim_list=(768, 384, 240, 576),
+        num_blocks_list=(16, 8, 4, 12),
+        num_heads_list=(8, 8, 4, 8),
+        generator_type_list=("mar", "mar", "mar", "mar"),
+        num_iters_list=(64, 128, 128, 256),
+        fractal_level=0,
+        **kwargs,
+    )
+    return model
+
+
+def octfractalgen_shapenet_vq576_b16(**kwargs):
+    """Maximum high-capacity ShapeNet terminal VQ predictor.
+
+    L3 (depth=6 VQ generator) is enlarged to 576 dim / 16 blocks. Use this
+    when VQ accuracy is the priority and batch size can be reduced if needed.
+
+    RoPE-compatible: 576 / 8 = 72, 72 % 6 == 0.
+    """
+    model = OctFractalGen(
+        depth_list=(3, 4, 5, 6),
+        embed_dim_list=(768, 384, 240, 576),
+        num_blocks_list=(16, 8, 4, 16),
+        num_heads_list=(8, 8, 4, 8),
+        generator_type_list=("mar", "mar", "mar", "mar"),
+        num_iters_list=(64, 128, 128, 256),
+        fractal_level=0,
+        **kwargs,
+    )
+    return model
+
+
+def octfractalgen_shapenet(**kwargs):
+    """Backward-compatible alias for the original ShapeNet model."""
+    return octfractalgen_shapenet_vq120_b2(**kwargs)
+
+
+def octfractalgen_shapenet_vqstrong(**kwargs):
+    """Backward-compatible alias for the first stronger VQ model."""
+    return octfractalgen_shapenet_vq240_b4(**kwargs)
 
 
 def octfractalgen_small(**kwargs):

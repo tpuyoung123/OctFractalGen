@@ -1,7 +1,8 @@
 """Generate 3D samples with trained OctFractalGen.
 
 Usage:
-  python generate_samples.py --ckpt logs/octfractalgen/uncond/latest.pth --num_samples 8
+  python generate_samples.py --ckpt <octfractalgen_ckpt> --vqvae_ckpt <vqvae_ckpt> \
+      --output_dir <sample_dir>
 
 Pipeline:
   1. Root token -> Level 0 (d=3): MAR sample split -> grow octree
@@ -15,7 +16,6 @@ import os
 import sys
 import copy
 import argparse
-import importlib.util
 
 # ---- ocnn environment setup (must happen before import ocnn) ----
 _CACHE_DIR = os.path.join(os.path.dirname(__file__), '.ocnn_cache')
@@ -30,20 +30,20 @@ import torch
 import ocnn
 from ocnn.octree import Octree
 
-from models.octfractalgen import octfractalgen_shapenet, octfractalgen_small
+from models.octfractalgen import (
+    octfractalgen_shapenet,
+    octfractalgen_shapenet_vq120_b2,
+    octfractalgen_shapenet_vq240_b4,
+    octfractalgen_shapenet_vq384_b8,
+    octfractalgen_shapenet_vq384_b16,
+    octfractalgen_shapenet_vq576_b8,
+    octfractalgen_shapenet_vq576_b12,
+    octfractalgen_shapenet_vq576_b16,
+    octfractalgen_shapenet_vqstrong,
+    octfractalgen_small,
+)
 from models.vae_loader import build_vqvae
-from utils import utils as frgen_utils  # octfractalgen/utils/utils.py
-
-
-# ---- import octgpt utils for create_mesh/export_octree (isolated) ----
-def _load_octgpt_utils():
-    spec = importlib.util.spec_from_file_location(
-        'octgpt_utils', r'd:\Python\3D_fractal_auto_regression\octgpt\utils\utils.py')
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-octgpt_utils = _load_octgpt_utils()
+from utils import utils as octgpt_utils
 
 
 def generate_one_sample(model, vqvae, device, full_depth=3, depth=8,
@@ -76,8 +76,8 @@ def generate_one_sample(model, vqvae, device, full_depth=3, depth=8,
     return result
 
 
-def export_mesh(neural_mpu, output_path, resolution=256, sdf_scale=0.9,
-                points_scale=1.0):
+def export_mesh(octgpt_utils, neural_mpu, output_path, resolution=256,
+                sdf_scale=0.9, points_scale=1.0):
     """Export neural_mpu to .obj via marching cubes (octgpt convention)."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     octgpt_utils.create_mesh(
@@ -94,11 +94,27 @@ def export_mesh(neural_mpu, output_path, resolution=256, sdf_scale=0.9,
 
 def main():
     parser = argparse.ArgumentParser(description='Generate samples with OctFractalGen')
-    parser.add_argument('--ckpt', type=str, default='logs/octfractalgen/uncond/latest.pth')
-    parser.add_argument('--vqvae_ckpt', type=str,
-                        default=r'd:\Python\3D_fractal_auto_regression\octgpt\saved_ckpt\vqvae_large_im5_uncond_bsq32.pth')
-    parser.add_argument('--output_dir', type=str, default='logs/octfractalgen/uncond/samples')
-    parser.add_argument('--model', type=str, default='shapenet', choices=['shapenet', 'small'])
+    parser.add_argument('--ckpt', type=str, required=True,
+                        help='Path to the trained OctFractalGen checkpoint.')
+    parser.add_argument('--vqvae_ckpt', type=str, required=True,
+                        help='Path to the pretrained OctGPT VQVAE checkpoint.')
+    parser.add_argument('--output_dir', type=str, required=True,
+                        help='Directory for generated .obj samples.')
+    parser.add_argument(
+        '--model',
+        type=str,
+        default='shapenet_vq576_b12',
+        choices=[
+            'shapenet',
+            'shapenet_vqstrong',
+            'shapenet_vq120_b2',
+            'shapenet_vq240_b4',
+            'shapenet_vq384_b8',
+            'shapenet_vq384_b16',
+            'shapenet_vq576_b8',
+            'shapenet_vq576_b12',
+            'shapenet_vq576_b16',
+            'small'])
     parser.add_argument('--num_samples', type=int, default=8)
     parser.add_argument('--resolution', type=int, default=256)
     parser.add_argument('--sdf_scale', type=float, default=0.9)
@@ -117,12 +133,32 @@ def main():
 
     # ---- VQVAE ----
     print('Loading pretrained VQVAE ...')
-    vqvae = build_vqvae(args.vqvae_ckpt, device=device, freeze=True)
+    vqvae = build_vqvae(
+        args.vqvae_ckpt,
+        device=device,
+        freeze=True,
+    )
 
     # ---- Model ----
     print('Building OctFractalGen ...')
     if args.model == 'shapenet':
         model = octfractalgen_shapenet()
+    elif args.model == 'shapenet_vqstrong':
+        model = octfractalgen_shapenet_vqstrong()
+    elif args.model == 'shapenet_vq120_b2':
+        model = octfractalgen_shapenet_vq120_b2()
+    elif args.model == 'shapenet_vq240_b4':
+        model = octfractalgen_shapenet_vq240_b4()
+    elif args.model == 'shapenet_vq384_b8':
+        model = octfractalgen_shapenet_vq384_b8()
+    elif args.model == 'shapenet_vq384_b16':
+        model = octfractalgen_shapenet_vq384_b16()
+    elif args.model == 'shapenet_vq576_b8':
+        model = octfractalgen_shapenet_vq576_b8()
+    elif args.model == 'shapenet_vq576_b12':
+        model = octfractalgen_shapenet_vq576_b12()
+    elif args.model == 'shapenet_vq576_b16':
+        model = octfractalgen_shapenet_vq576_b16()
     else:
         model = octfractalgen_small()
     model.to(device)
@@ -173,7 +209,7 @@ def main():
                       f'{elapsed:.1f}s -> {output_path}')
             else:
                 neural_mpu = result
-                export_mesh(neural_mpu, output_path,
+                export_mesh(octgpt_utils, neural_mpu, output_path,
                             resolution=args.resolution,
                             sdf_scale=args.sdf_scale)
                 # report vertex/face count
