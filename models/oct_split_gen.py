@@ -19,22 +19,17 @@ class OctSplitGenerator(nn.Module):
         num_blocks,
         num_heads,
         generator_type="mar",
-        num_iters=128,
         patch_size=1024,
         dilation=2,
         use_swin=True,
         use_checkpoint=True,
         attn_dropout=0.0,
         proj_dropout=0.1,
-        full_depth=3,
-        max_depth=8,
         propagate_cond_context=True,
     ):
         super().__init__()
         self.depth = depth
-        self.embed_dim = embed_dim
         self.generator_type = generator_type
-        self.num_iters = num_iters
         self.patch_size = patch_size
         self.dilation = dilation
         self.use_swin = use_swin

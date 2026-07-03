@@ -2,17 +2,14 @@ import os
 import sys
 import time
 import math
-import glob
 import json
 import argparse
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
-import ocnn
-from ocnn.octree import Octree, Points
 from models.octfractalgen import (
     octfractalgen_shapenet_vq120_b2,
     octfractalgen_shapenet_vq240_b4,
@@ -27,119 +24,11 @@ from models.vae_loader import build_vqvae
 from utils.metrics import format_focus_metrics
 from utils.utils import octree2seq
 from utils.lr_sched import adjust_learning_rate
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-def strip_octree_runtime_fields(octree):
-    """Remove runtime-only tensors before writing an octree to disk cache."""
-    if hasattr(octree, "neighs") and octree.neighs is not None:
-        octree.neighs = [None for _ in octree.neighs]
-    return octree
-
-
-def octree_has_runtime_fields(octree):
-    return any(x is not None for x in getattr(octree, "neighs", []) or [])
-
-
-def ensure_octree_neighs(octree, full_depth=3, depth=8):
-    for d in range(full_depth, depth + 1):
-        if octree.neighs[d] is None:
-            octree.construct_neigh(d)
-    return octree
-
-
-class ShapeNetOctreeDataset(Dataset):
-    """Loads .npz point clouds and builds octrees for OctFractalGen training."""
-
-    def __init__(
-        self,
-        data_dir,
-        depth=8,
-        full_depth=3,
-        points_scale=1.0,
-        cache_dir=None,
-        compact_cache_on_load=True,
-    ):
-        self.data_dir = data_dir
-        self.depth = depth
-        self.full_depth = full_depth
-        self.points_scale = points_scale
-        self.cache_dir = cache_dir
-        self.compact_cache_on_load = compact_cache_on_load
-
-        self.files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
-        if len(self.files) == 0:
-            raise RuntimeError(f"No .npz files found in {data_dir}")
-        print(f"[Dataset] Found {len(self.files)} samples in {data_dir}")
-
-        if cache_dir:
-            os.makedirs(cache_dir, exist_ok=True)
-
-    def __len__(self):
-        return len(self.files)
-
-    def _cache_path(self, idx):
-        if not self.cache_dir:
-            return None
-        stem = os.path.splitext(os.path.basename(self.files[idx]))[0]
-        return os.path.join(self.cache_dir, f"{stem}.octree.pth")
-
-    def _build_octree(self, npz_path):
-        raw = np.load(npz_path)
-        points = torch.from_numpy(raw["points"]).float()
-        normals = torch.from_numpy(raw["normals"]).float()
-        points = points / self.points_scale  # normalize to [-1, 1]
-        pts = Points(points=points, normals=normals)
-        pts.clip(-1.0, 1.0)
-        octree = Octree(depth=self.depth, full_depth=self.full_depth)
-        octree.build_octree(pts)
-        return octree
-
-    def __getitem__(self, idx):
-        cache_path = self._cache_path(idx)
-        # try cache
-        if cache_path and os.path.exists(cache_path):
-            try:
-                octree = torch.load(cache_path, weights_only=False)
-                if self.compact_cache_on_load and octree_has_runtime_fields(octree):
-                    strip_octree_runtime_fields(octree)
-                    torch.save(octree, cache_path)
-                return octree
-            except Exception:
-                pass  # cache corrupt, rebuild
-
-        octree = self._build_octree(self.files[idx])
-
-        # save cache
-        if cache_path:
-            try:
-                strip_octree_runtime_fields(octree)
-                torch.save(octree, cache_path)
-            except Exception:
-                pass
-        return octree
-
-
-def octree_collate_fn(batch):
-    """Return list of octrees; merging is done in main process to avoid
-    ocnn crashes under Windows multiprocessing (construct_neigh access violation)."""
-    return batch
-
-
-def merge_octree_batch(octrees, full_depth=3, depth=8):
-    """Merge a list of octrees into one batched octree (main process only).
-
-    construct_neigh is called here because it crashes ocnn C++ extension
-    when run inside DataLoader worker processes on Windows.
-    """
-    if len(octrees) == 1:
-        return ensure_octree_neighs(octrees[0], full_depth, depth)
-    batched = Octree.init_like(octrees[0])
-    batched.merge_octrees(octrees)
-    # merge_octrees does not carry over neighs; rebuild for conv ops
-    return ensure_octree_neighs(batched, full_depth, depth)
+from datasets import (
+    ShapeNetOctreeDataset,
+    octree_collate_fn,
+    merge_octree_batch,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +95,6 @@ def train_one_epoch(
         p.requires_grad = False
     total_loss = 0.0
     total_split_loss = 0.0
-    total_vq_loss = 0.0
     # metrics accumulators
     metric_sums = {}  # key -> float sum
     metric_counts = {}  # key -> int count
@@ -318,8 +206,6 @@ def main():
         type=str,
         default="shapenet_vq576_b12",
         choices=[
-            "shapenet",
-            "shapenet_vqstrong",
             "shapenet_vq120_b2",
             "shapenet_vq240_b4",
             "shapenet_vq384_b8",
@@ -327,7 +213,6 @@ def main():
             "shapenet_vq576_b8",
             "shapenet_vq576_b12",
             "shapenet_vq576_b16",
-            "small",
         ],
         help="Model variant. vq{dim}_b{blocks} = L3 (terminal VQ generator) "
         "embed_dim and num_blocks, all sharing L0=768/L1=384/L2=240.",
@@ -351,27 +236,15 @@ def main():
         help="Gradient clipping max norm; <=0 disables clipping",
     )
     parser.add_argument(
-        "--vq_loss_weight",
-        type=float,
-        default=2.0,
-        help="Weight applied to terminal VQ loss in the total loss",
-    )
-    parser.add_argument(
         "--vq_mask_ratio_min",
         type=float,
         default=0.5,
         help="Minimum MAR mask ratio for VQ prediction",
     )
     parser.add_argument(
-        "--vq_mask_ratio_max",
-        type=float,
-        default=1.0,
-        help="Maximum MAR mask ratio for VQ prediction",
-    )
-    parser.add_argument(
         "--vq_random_flip",
         type=float,
-        default=0.1,
+        default=0.0,
         help="Random bit flip probability for VQ teacher forcing",
     )
     parser.add_argument(
@@ -387,56 +260,11 @@ def main():
         help="Fraction of low-confidence VQ positions to remask during sampling",
     )
     parser.add_argument(
-        "--vq_denoise_weight",
-        type=float,
-        default=0.3,
-        help="Weight for denoising loss on flipped non-masked VQ positions (0=disabled)",
-    )
-    parser.add_argument(
         "--p0",
         action="store_true",
         default=False,
-        help="Enable P0 recipe: all_weighted loss + batch_var_ema weighting + "
-        "label_smoothing 0.1 + mask schedule loc=0.7/scale=0.2/min=0.3/max=1.0 "
-        "+ denoise off + vq_loss_weight 4.0. VQ remains trainable by default.",
-    )
-    parser.add_argument(
-        "--vq_loss_mode",
-        choices=["masked", "all_weighted"],
-        default="masked",
-        help="VQ loss mode: 'masked' (legacy, only masked positions) or "
-        "'all_weighted' (CE on all positions, mask/reveal weighted).",
-    )
-    parser.add_argument(
-        "--vq_label_smoothing",
-        type=float,
-        default=0.0,
-        help="Label smoothing for VQ CE loss (0=disabled).",
-    )
-    parser.add_argument(
-        "--vq_mask_loss_weight",
-        type=float,
-        default=2.0,
-        help="In 'all_weighted' mode, loss weight for masked positions.",
-    )
-    parser.add_argument(
-        "--vq_reveal_loss_weight",
-        type=float,
-        default=0.5,
-        help="In 'all_weighted' mode, loss weight for revealed positions.",
-    )
-    parser.add_argument(
-        "--vq_bit_weight",
-        choices=["uniform", "batch_var", "batch_var_ema"],
-        default="uniform",
-        help="Per-bit loss weighting. batch_var_ema is the recommended stable "
-        "variant for improving masked VQ accuracy.",
-    )
-    parser.add_argument(
-        "--vq_bit_weight_ema_decay",
-        type=float,
-        default=0.99,
-        help="EMA decay for --vq_bit_weight batch_var_ema.",
+        help="Enable P1/P2 architectural enhancements: bit_pos_emb + FiLM "
+        "condition injection. Loss follows OctGPT convention (plain masked CE).",
     )
     parser.add_argument(
         "--vq_use_bit_pos_emb",
@@ -458,18 +286,6 @@ def main():
         type=int,
         default=4,
         help="Number of attention heads for --vq_cond_injection cross_attn.",
-    )
-    parser.add_argument(
-        "--vq_mask_ratio_loc",
-        type=float,
-        default=1.0,
-        help="MAR mask ratio truncnorm loc (OctGPT default 1.0).",
-    )
-    parser.add_argument(
-        "--vq_mask_ratio_scale",
-        type=float,
-        default=0.25,
-        help="MAR mask ratio truncnorm scale (OctGPT default 0.25).",
     )
     parser.add_argument(
         "--freeze_vq_epochs",
@@ -516,44 +332,19 @@ def main():
         if not cli_has_option(*option_names):
             setattr(args, arg_name, value)
 
-    # ---- P0 recipe defaults: keep user-specified CLI values intact ----
+    # ---- P1/P2 architectural enhancements: enabled via --p0 ----
     if args.p0:
-        apply_p0_default("vq_loss_mode", "all_weighted", "--vq_loss_mode")
-        apply_p0_default("vq_label_smoothing", 0.1, "--vq_label_smoothing")
-        apply_p0_default("vq_mask_loss_weight", 2.0, "--vq_mask_loss_weight")
-        apply_p0_default("vq_reveal_loss_weight", 0.5, "--vq_reveal_loss_weight")
-        apply_p0_default("vq_bit_weight", "batch_var_ema", "--vq_bit_weight")
-        apply_p0_default("vq_bit_weight_ema_decay", 0.99, "--vq_bit_weight_ema_decay")
-        apply_p0_default("vq_mask_ratio_loc", 0.7, "--vq_mask_ratio_loc")
-        apply_p0_default("vq_mask_ratio_scale", 0.2, "--vq_mask_ratio_scale")
-        apply_p0_default("vq_mask_ratio_min", 0.3, "--vq_mask_ratio_min")
-        apply_p0_default("vq_mask_ratio_max", 1.0, "--vq_mask_ratio_max")
-        apply_p0_default("vq_denoise_weight", 0.0, "--vq_denoise_weight")
-        apply_p0_default("vq_loss_weight", 4.0, "--vq_loss_weight")
-        apply_p0_default("freeze_vq_epochs", 0, "--freeze_vq_epochs")
-        # P1/P2 enhancements (on top of P0 loss/mask recipe)
         apply_p0_default("vq_use_bit_pos_emb", True, "--vq_use_bit_pos_emb")
         apply_p0_default("vq_cond_injection", "film", "--vq_cond_injection")
-        print(">> P0 recipe ENABLED. Defaults applied where CLI did not override.")
+        print(">> P1/P2 enhancements ENABLED (bit_pos_emb + FiLM). "
+              "Loss follows OctGPT convention.")
 
     # normalize legacy -1 to disabled
     if args.freeze_vq_epochs < 0:
         args.freeze_vq_epochs = 0
 
-    if not (0.0 <= args.vq_mask_ratio_min < args.vq_mask_ratio_max <= 1.0):
-        raise ValueError("--vq_mask_ratio_min/max must satisfy 0 <= min < max <= 1")
-    if args.vq_mask_ratio_scale <= 0.0:
-        raise ValueError("--vq_mask_ratio_scale must be > 0")
-    if not (0.0 <= args.vq_mask_ratio_loc <= 1.0):
-        raise ValueError("--vq_mask_ratio_loc must be in [0, 1]")
-    if not (0.0 <= args.vq_label_smoothing < 1.0):
-        raise ValueError("--vq_label_smoothing must be in [0, 1)")
-    if args.vq_mask_loss_weight < 0.0 or args.vq_reveal_loss_weight < 0.0:
-        raise ValueError("--vq_mask/reveal_loss_weight must be non-negative")
-    if args.vq_mask_loss_weight == 0.0 and args.vq_reveal_loss_weight == 0.0:
-        raise ValueError("At least one VQ position loss weight must be > 0")
-    if not (0.0 <= args.vq_bit_weight_ema_decay < 1.0):
-        raise ValueError("--vq_bit_weight_ema_decay must be in [0, 1)")
+    if not (0.0 <= args.vq_mask_ratio_min < 1.0):
+        raise ValueError("--vq_mask_ratio_min must be in [0, 1)")
 
     os.makedirs(args.logdir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -573,20 +364,9 @@ def main():
     print("Building OctFractalGen ...")
     model_kwargs = dict(
         vq_mask_ratio_min=args.vq_mask_ratio_min,
-        vq_mask_ratio_max=args.vq_mask_ratio_max,
-        vq_mask_ratio_loc=args.vq_mask_ratio_loc,
-        vq_mask_ratio_scale=args.vq_mask_ratio_scale,
         vq_random_flip=args.vq_random_flip,
         vq_remask_stage=args.vq_remask_stage,
         vq_remask_prob=args.vq_remask_prob,
-        vq_loss_weight=args.vq_loss_weight,
-        vq_denoise_weight=args.vq_denoise_weight,
-        vq_loss_mode=args.vq_loss_mode,
-        vq_label_smoothing=args.vq_label_smoothing,
-        vq_mask_loss_weight=args.vq_mask_loss_weight,
-        vq_reveal_loss_weight=args.vq_reveal_loss_weight,
-        vq_bit_weight_mode=args.vq_bit_weight,
-        vq_bit_weight_ema_decay=args.vq_bit_weight_ema_decay,
         vq_use_bit_pos_emb=args.vq_use_bit_pos_emb,
         vq_cond_injection=args.vq_cond_injection,
         vq_cond_cross_attn_heads=args.vq_cond_cross_attn_heads,
