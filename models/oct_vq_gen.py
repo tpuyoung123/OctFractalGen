@@ -20,7 +20,41 @@ import torch.nn.functional as F
 
 from models.octformer import OctFormer, OctreeT
 from models.positional_embedding import SinPosEmb
+from utils.metrics import get_correct_topk, compute_vq_accuracy
 from utils.utils import sample, depth2batch, batch2depth
+
+
+def _patch_octreed_split_batch_id():
+    """Patch OctreeD.octree_split for ocnn/ognn batch_id mismatch.
+
+    OctreeD.batch_id(depth) returns dual-graph batch ids, whose length can
+    include retained ancestor leaves. ocnn.Octree.octree_split expects
+    current-depth octree batch ids with length == split.shape[0]. Temporarily
+    switching graph.batch_id to keys[depth] >> 48 keeps OctreeD updates usable.
+    """
+    import ognn.octreed as _octreed
+
+    orig_split = _octreed.OctreeD.octree_split
+    if getattr(orig_split, "_octfractalgen_batch_id_patch", False):
+        return
+
+    def patched_split(self, split, depth):
+        graph = self.graphs[depth] if depth < len(self.graphs) else None
+        saved_batch_id = None
+        if graph is not None and graph.batch_id is not None:
+            keys = self.keys[depth] if depth < len(self.keys) else None
+            if keys is not None and keys.shape[0] == split.shape[0]:
+                saved_batch_id = graph.batch_id
+                graph.batch_id = keys >> 48
+        try:
+            return orig_split(self, split, depth)
+        finally:
+            if saved_batch_id is not None:
+                self.graphs[depth].batch_id = saved_batch_id
+
+    patched_split._octfractalgen_batch_id_patch = True
+    patched_split._octfractalgen_orig_split = orig_split
+    _octreed.OctreeD.octree_split = patched_split
 
 
 class OctVQGenerator(nn.Module):
@@ -35,13 +69,49 @@ class OctVQGenerator(nn.Module):
                  vq_groups=32, num_iters=256, generator_type="mar",
                  patch_size=1024, dilation=2, use_swin=True, use_checkpoint=True,
                  attn_dropout=0.0, proj_dropout=0.1,
-                 mask_ratio_min=0.5, random_flip=0.1,
+                 mask_ratio_min=0.5, mask_ratio_max=1.0,
+                 mask_ratio_loc=1.0, mask_ratio_scale=0.25,
+                 random_flip=0.1,
                  remask_stage=0.7, remask_prob=0.1,
                  loss_weight=1.0, denoise_weight=0.3,
-                 full_depth=3, max_depth=8):
+                 loss_mode="masked", label_smoothing=0.0,
+                 mask_loss_weight=2.0, reveal_loss_weight=0.5,
+                 bit_weight_mode="uniform", bit_weight_ema_decay=0.99,
+                 full_depth=3, max_depth=8,
+                 cond_embed_dims=None):
         super().__init__()
+        if not (0.0 <= mask_ratio_min < mask_ratio_max <= 1.0):
+            raise ValueError(
+                "mask_ratio_min/max must satisfy 0 <= min < max <= 1")
+        if mask_ratio_scale <= 0.0:
+            raise ValueError("mask_ratio_scale must be > 0")
+        if not (0.0 <= mask_ratio_loc <= 1.0):
+            raise ValueError("mask_ratio_loc must be in [0, 1]")
+        if loss_mode not in ("masked", "all_weighted"):
+            raise ValueError(f"Unknown VQ loss mode: {loss_mode}")
+        if not (0.0 <= label_smoothing < 1.0):
+            raise ValueError("label_smoothing must be in [0, 1)")
+        if mask_loss_weight < 0.0 or reveal_loss_weight < 0.0:
+            raise ValueError("mask/reveal loss weights must be non-negative")
+        if mask_loss_weight == 0.0 and reveal_loss_weight == 0.0:
+            raise ValueError("At least one VQ loss position weight must be > 0")
+        if bit_weight_mode not in ("uniform", "batch_var", "batch_var_ema"):
+            raise ValueError(f"Unknown VQ bit weight mode: {bit_weight_mode}")
+        if not (0.0 <= bit_weight_ema_decay < 1.0):
+            raise ValueError("bit_weight_ema_decay must be in [0, 1)")
+        if cond_embed_dims is None:
+            cond_embed_dims = (cond_embed_dim,)
+        else:
+            cond_embed_dims = tuple(cond_embed_dims)
+            if len(cond_embed_dims) == 0:
+                raise ValueError("cond_embed_dims must not be empty")
+            if cond_embed_dims[-1] != cond_embed_dim:
+                raise ValueError(
+                    "cond_embed_dims[-1] must match cond_embed_dim")
+
         self.depth = depth                 # terminal depth, e.g. 6
         self.embed_dim = embed_dim
+        self.vq_size = 2                   # BSQ bit classification: 0/1
         self.vq_groups = vq_groups         # BSQ32 -> 32
         self.num_iters = num_iters
         self.generator_type = generator_type
@@ -53,12 +123,27 @@ class OctVQGenerator(nn.Module):
         self.remask_prob = remask_prob
         self.loss_weight = loss_weight
         self.denoise_weight = denoise_weight
+        # P0.1 loss redesign
+        self.loss_mode = loss_mode            # "masked" (legacy) | "all_weighted"
+        self.label_smoothing = label_smoothing
+        self.mask_loss_weight = mask_loss_weight
+        self.reveal_loss_weight = reveal_loss_weight
+        self.bit_weight_mode = bit_weight_mode
+        self.bit_weight_ema_decay = bit_weight_ema_decay
+        self.cond_embed_dims = cond_embed_dims
+        self.cond_context_scale = len(cond_embed_dims) ** -0.5
+        self.register_buffer(
+            "bit_var_ema", torch.ones(vq_groups), persistent=False)
 
         # VQ code projection: BSQ32 quantized code zq -> embedding.
         # For BSQ, zq is (-1/+1) / sqrt(32), matching OctGPT.
         self.vq_proj = nn.Linear(vq_groups, embed_dim)
 
-        # condition projection: parent features -> current embed_dim (bias)
+        # condition projections: multi-level split features -> current embed_dim
+        self.extra_cond_projs = nn.ModuleList([
+            nn.Linear(dim, embed_dim) for dim in cond_embed_dims[:-1]
+        ])
+        # Keep the direct-parent projection name stable for old diagnostics.
         self.cond_proj = nn.Linear(cond_embed_dim, embed_dim)
 
         # mask token for MAR (unrevealed positions)
@@ -75,11 +160,13 @@ class OctVQGenerator(nn.Module):
 
         # VQ head: 32 independent binary classifications (BSQ32)
         # output shape: (N, 2 * vq_groups) -> reshape to (N, vq_groups, 2)
-        self.vq_head = nn.Linear(embed_dim, 2 * vq_groups)
+        self.vq_head = nn.Linear(embed_dim, self.vq_size * vq_groups)
 
         # MAR masking ratio distribution, matching OctGPT's high-mask training.
         self.mask_ratio_generator = stats.truncnorm(
-            (mask_ratio_min - 1.0) / 0.25, 0, loc=1.0, scale=0.25)
+            (mask_ratio_min - mask_ratio_loc) / mask_ratio_scale,
+            (mask_ratio_max - mask_ratio_loc) / mask_ratio_scale,
+            loc=mask_ratio_loc, scale=mask_ratio_scale)
 
         self._init_weights()
 
@@ -102,13 +189,8 @@ class OctVQGenerator(nn.Module):
     def _bsq_indices_to_code(self, indices):
         return (indices.float() * 2.0 - 1.0) * (1.0 / self.vq_groups ** 0.5)
 
-    def _get_correct_topk(self, logits, targets, topk=1):
-        topk = min(topk, logits.shape[-1] - 1)
-        topk = torch.topk(logits, topk, dim=-1).indices
-        return topk.eq(targets.unsqueeze(-1).expand_as(topk))
-
     def _get_remask(self, logits, tokens, mask, remask_prob=0.1, topk=5):
-        correct_topk = self._get_correct_topk(logits, tokens, topk=topk)
+        correct_topk = get_correct_topk(logits, tokens, topk=topk)
         correct_by_group = correct_topk.any(dim=-1)
         num_incorrect = (~correct_by_group).sum(dim=-1)
         num_incorrect[mask] = 0
@@ -123,6 +205,20 @@ class OctVQGenerator(nn.Module):
         remask[remask_indices] = True
         return remask & ~mask
 
+    def _get_bit_weight(self, target_vq, dtype):
+        if self.bit_weight_mode == "uniform" or not self.training:
+            return None
+
+        bit_var = target_vq.float().var(dim=0, unbiased=False).clamp_min(1e-4)
+        if self.bit_weight_mode == "batch_var_ema":
+            with torch.no_grad():
+                decay = self.bit_weight_ema_decay
+                self.bit_var_ema.mul_(decay).add_(bit_var.detach(), alpha=1.0 - decay)
+            bit_var = self.bit_var_ema
+
+        bit_w = bit_var / bit_var.mean().clamp_min(1e-6)
+        return bit_w.clamp(0.25, 4.0).to(dtype)
+
     # ------------------------------------------------------------------
     # shared encoder
     # ------------------------------------------------------------------
@@ -133,15 +229,46 @@ class OctVQGenerator(nn.Module):
             octree: octree (GT during training, growing during sampling)
             vq_codes: (N_d, vq_groups) BSQ quantized code zq.
                 Unrevealed positions can be any value (will be overwritten).
-            cond_list: [parent_features] with shape (N_d, cond_embed_dim)
+            cond_list: context feature tensors aligned to terminal depth.
+                When multi-context is enabled this is [d3, d4, d5] split
+                features after repeated unpooling to depth self.depth.
             mask: bool tensor (N_d,) True=unrevealed (use mask_token).
                 None for no masking.
         Returns:
             x: (N_d, embed_dim) encoded features
         """
-        parent_features = cond_list[0]
-        cond = self.cond_proj(parent_features)               # (N_d, E) bias
-        vq_codes = vq_codes.to(dtype=parent_features.dtype)
+        if len(cond_list) != len(self.cond_embed_dims):
+            if len(cond_list) == 1:
+                context_features = cond_list
+                context_projs = [self.cond_proj]
+                context_scale = 1.0
+            else:
+                raise ValueError(
+                    f"Expected {len(self.cond_embed_dims)} VQ context tensors, "
+                    f"got {len(cond_list)}")
+        else:
+            context_features = cond_list
+            context_projs = list(self.extra_cond_projs) + [self.cond_proj]
+            context_scale = self.cond_context_scale
+
+        # If the whole VQ generator is frozen, do not let its loss reshape the
+        # parent split features through a fixed, untrainable VQ head.
+        detach_context = (
+            self.training and not any(p.requires_grad for p in self.parameters())
+        )
+        cond = None
+        for features, proj in zip(context_features, context_projs):
+            if features.shape[0] != vq_codes.shape[0]:
+                raise ValueError(
+                    "VQ context node count must match vq_codes node count: "
+                    f"{features.shape[0]} vs {vq_codes.shape[0]}")
+            if detach_context:
+                features = features.detach()
+            projected = proj(features)
+            cond = projected if cond is None else cond + projected
+        cond = cond * context_scale
+
+        vq_codes = vq_codes.to(dtype=cond.dtype)
         x = self.vq_proj(vq_codes) + cond                    # (N_d, E) token + cond
 
         if mask is not None:
@@ -171,7 +298,9 @@ class OctVQGenerator(nn.Module):
 
         Args:
             octree: GT octree
-            cond_list: [parent_features] (N_6, cond_embed_dim)
+            cond_list: terminal-depth context feature tensors. With the
+                default OctFractalGen wiring this is [d3, d4, d5] split
+                features aligned to N_6 nodes.
             targets: dict with 'vq' key -> (N_6, vq_groups) in {0, 1}
         Returns:
             (weighted_vq_loss, metrics_dict): metrics_dict contains
@@ -205,37 +334,56 @@ class OctVQGenerator(nn.Module):
 
         # teacher forcing: revealed positions use BSQ zq embedding, as in OctGPT.
         x = self._encode(octree, input_vq_code, cond_list, mask)
-        vq_logits = self.vq_head(x).reshape(-1, self.vq_groups, 2)  # (N, 32, 2)
+        vq_logits = self.vq_head(x).reshape(
+            -1, self.vq_groups, self.vq_size)  # (N, 32, 2)
 
-        # Loss computation: focus prediction gradient on masked positions.
-        # When random_flip is active, OctGPT computes loss on ALL tokens
-        # (denoising + prediction). But the small L3 model (120 dim / 2 blocks)
-        # cannot handle both tasks effectively, causing vq_top5_acc to plateau
-        # at ~0.75. Fix: main prediction loss on masked positions only; add a
-        # low-weight denoising loss on flipped non-masked positions so the
-        # model still learns noise robustness without diluting prediction
-        # gradient.
+        bit_w = self._get_bit_weight(target_vq, vq_logits.dtype)
+
+        # ---- Loss computation ----
+        # Two modes:
+        #   "masked" (legacy): CE only on masked positions + optional denoise
+        #       on flipped non-masked. Wastes ~50% revealed-position supervision.
+        #   "all_weighted" (P0.1): CE on all positions, masked weighted by
+        #       mask_loss_weight, revealed by reveal_loss_weight. Denoise is
+        #       subsumed (flipped revealed positions are already penalized).
         if mask is None:
             # eval / non-MAR: loss on all tokens
-            logits_flat = vq_logits.reshape(-1, 2)
+            logits_flat = vq_logits.reshape(-1, self.vq_size)
             target_flat = target_vq.reshape(-1)
-            raw_loss = F.cross_entropy(logits_flat, target_flat)
-            logits_for_metric = vq_logits
-            target_for_metric = target_vq
+            raw_loss = F.cross_entropy(
+                logits_flat, target_flat,
+                label_smoothing=self.label_smoothing)
+        elif self.loss_mode == "all_weighted":
+            # P0.1: per-bit CE on all positions, then weight by mask/reveal
+            ce_per_bit = F.cross_entropy(
+                vq_logits.reshape(-1, self.vq_size),
+                target_vq.reshape(-1),
+                reduction='none',
+                label_smoothing=self.label_smoothing,
+            ).reshape(-1, self.vq_groups)  # (N, 32)
+            if bit_w is not None:
+                ce_per_bit = ce_per_bit * bit_w  # broadcast (32,)
+            ce_per_pos = ce_per_bit.mean(dim=-1)  # (N,)
+            weight = torch.where(
+                mask,
+                torch.full_like(ce_per_pos, self.mask_loss_weight),
+                torch.full_like(ce_per_pos, self.reveal_loss_weight),
+            )
+            raw_loss = (ce_per_pos * weight).sum() / weight.sum().clamp_min(1e-6)
         else:
-            # MAR training: prediction loss on masked positions only
-            pred_logits = vq_logits[mask].reshape(-1, 2)
+            # legacy "masked" mode: prediction loss on masked positions only
+            pred_logits = vq_logits[mask].reshape(-1, self.vq_size)
             pred_target = target_vq[mask].reshape(-1)
-            raw_loss = F.cross_entropy(pred_logits, pred_target)
-            logits_for_metric = vq_logits[mask]
-            target_for_metric = target_vq[mask]
+            raw_loss = F.cross_entropy(
+                pred_logits, pred_target,
+                label_smoothing=self.label_smoothing)
 
             # low-weight denoising loss on flipped non-masked positions
-            if use_random_flip:
+            if use_random_flip and self.denoise_weight > 0.0:
                 revealed = ~mask
                 flipped = revealed & (input_vq != target_vq).any(dim=-1)
                 if flipped.any():
-                    denoise_logits = vq_logits[flipped].reshape(-1, 2)
+                    denoise_logits = vq_logits[flipped].reshape(-1, self.vq_size)
                     denoise_target = target_vq[flipped].reshape(-1)
                     denoise_loss = F.cross_entropy(denoise_logits, denoise_target)
                     raw_loss = raw_loss + self.denoise_weight * denoise_loss
@@ -243,22 +391,15 @@ class OctVQGenerator(nn.Module):
         loss = raw_loss * self.loss_weight
 
         with torch.no_grad():
-            vq_pred = logits_for_metric.argmax(dim=-1)
-            vq_bit_acc = (vq_pred == target_for_metric).float().mean()
-            vq_code_acc = (vq_pred == target_for_metric).all(dim=-1).float().mean()
-            vq_mask_ratio = (
-                mask.float().mean()
-                if mask is not None
-                else torch.zeros((), device=octree.device)
-            )
+            acc = compute_vq_accuracy(
+                vq_logits, target_vq, mask=mask,
+                vq_groups=self.vq_groups, vq_size=self.vq_size,
+                topk=5, device=octree.device)
 
         return loss, {
             'vq_loss': raw_loss.detach(),
             'vq_loss_weighted': loss.detach(),
-            'vq_bit_acc': vq_bit_acc,
-            'vq_top5_acc': vq_bit_acc,  # backward-compatible alias
-            'vq_code_acc': vq_code_acc,
-            'vq_mask_ratio': vq_mask_ratio,
+            **acc,
         }
 
     # ------------------------------------------------------------------
@@ -295,7 +436,8 @@ class OctVQGenerator(nn.Module):
         for step in range(num_iter):
             # forward with current mask (revealed=BSQ zq, masked=mask_token+cond)
             x = self._encode(octree, vq_code, cond_list, mask)
-            vq_logits = self.vq_head(x).reshape(-1, self.vq_groups, 2)
+            vq_logits = self.vq_head(x).reshape(
+                -1, self.vq_groups, self.vq_size)
 
             # cosine schedule: number of masked positions for NEXT step
             mask_ratio = math.cos(math.pi / 2.0 * (step + 1) / num_iter)
@@ -326,7 +468,7 @@ class OctVQGenerator(nn.Module):
             if not mask_to_pred.any():
                 continue
             sampled = sample(
-                vq_logits[mask_to_pred].reshape(-1, 2),
+                vq_logits[mask_to_pred].reshape(-1, self.vq_size),
                 temperature=cur_temperature)
             sampled = sampled.reshape(-1, self.vq_groups)
             vq_pred[mask_to_pred] = sampled.long()
@@ -347,26 +489,20 @@ class OctVQGenerator(nn.Module):
         # ------ VQVAE decode: depth 6 -> depth 8 -> mesh ------
         zq = vqvae.quantizer.extract_code(vq_pred)  # (N_6, 32) continuous
 
-        # Grow the octree from self.depth (6) to depth 8 with all-split
-        # (split=1) so that the VQVAE decoder has a complete octree structure.
-        # update_octree=False is used to avoid an OctreeD deepcopy batch_id bug.
-        for d in range(self.depth, 8):
-            split_one = torch.ones(
-                octree.nnum[d], device=device).long()
-            octree.octree_split(split_one, d)
-            octree.octree_grow(d + 1)
-
-        # build neighs for VQVAE convolutions (encoder + decoder)
-        for d in range(octree.full_depth, octree.depth + 1):
+        # Build neighborhoods only through the code depth. The VQVAE decoder
+        # updates/grows d7-d8 itself when update_octree=True.
+        for d in range(octree.full_depth, self.depth + 1):
             octree.construct_neigh(d)
 
         from ognn.octreed import OctreeD
-        doctree = OctreeD(octree)
-        # update_octree=False: use the all-split structure as-is;
-        # the decoder only predicts signals (neural_mpu) without refining
-        # the octree structure. This avoids OctreeD deepcopy batch_id bug.
+        _patch_octreed_split_batch_id()
+
+        # max_depth=self.depth avoids requiring pre-existing d7/d8 graphs.
+        # The output dual octree is a separate copy so decoder split updates do
+        # not mutate the input code octree used for encoder/skip alignment.
+        doctree_in = OctreeD(octree, max_depth=self.depth)
+        doctree_out = copy.deepcopy(doctree_in)
         output = vqvae.decode_code(
-            zq, self.depth, doctree,
-            copy.deepcopy(doctree), update_octree=False)
+            zq, self.depth, doctree_in, doctree_out, update_octree=True)
 
         return output['neural_mpu']

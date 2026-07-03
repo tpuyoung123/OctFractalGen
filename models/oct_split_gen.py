@@ -28,6 +28,7 @@ class OctSplitGenerator(nn.Module):
         proj_dropout=0.1,
         full_depth=3,
         max_depth=8,
+        propagate_cond_context=True,
     ):
         super().__init__()
         self.depth = depth
@@ -37,6 +38,7 @@ class OctSplitGenerator(nn.Module):
         self.patch_size = patch_size
         self.dilation = dilation
         self.use_swin = use_swin
+        self.propagate_cond_context = propagate_cond_context
 
         # split token embedding: 0=leaf, 1=split (revealed positions use this)
         self.split_emb = nn.Embedding(2, embed_dim)
@@ -97,13 +99,14 @@ class OctSplitGenerator(nn.Module):
             octree: octree (GT during training, growing during sampling)
             split_tokens: (N_d,) long in {0, 1}; revealed split values.
                 Unrevealed positions can be any value (will be overwritten).
-            cond_list: [parent_features] with shape (N_d, cond_embed_dim)
+            cond_list: context feature tensors aligned to depth self.depth.
+                The last tensor is the direct parent feature for this level.
             mask: bool tensor (N_d,) True=unrevealed (use mask_token).
                 None for no masking.
         Returns:
             x: (N_d, embed_dim) encoded features
         """
-        parent_features = cond_list[0]
+        parent_features = cond_list[-1]
         cond = self.cond_proj(parent_features)  # (N_d, E) condition bias
         x = self.split_emb(split_tokens) + cond  # (N_d, E) token + cond
 
@@ -139,11 +142,12 @@ class OctSplitGenerator(nn.Module):
 
         Args:
             octree: GT octree
-            cond_list: [parent_features] (N_d, cond_embed_dim)
+            cond_list: context feature tensors aligned to depth self.depth.
+                The last tensor is the direct parent feature for this level.
             target_split: (N_d,) long in {0, 1} GT split tokens (teacher forcing)
         Returns:
             split_logits: (N_d, 2)
-            cond_list_next: [child_features] shape (N_{d+1}, embed_dim)
+            cond_list_next: split feature tensors aligned to depth self.depth + 1
             aux_loss: 0.0 (no auxiliary loss)
         """
         nnum_d = octree.nnum[self.depth]
@@ -164,9 +168,17 @@ class OctSplitGenerator(nn.Module):
         split_logits = self.split_head(x)  # (N_d, 2)
         features = self.feature_head(x)  # (N_d, embed_dim)
 
-        # unpool features to next depth (parent -> 8 children)
+        # Unpool features to next depth (parent -> 8 children). Previous
+        # split-level features are kept and re-aligned so terminal VQ can
+        # condition on the whole d3-d5 hierarchy.
+        cond_list_prev = []
+        if self.propagate_cond_context:
+            cond_list_prev = [
+                octree_copy_unpool(cond, octree, self.depth, nempty=False)
+                for cond in cond_list
+            ]
         cond_next = octree_copy_unpool(features, octree, self.depth, nempty=False)
-        cond_list_next = [cond_next]
+        cond_list_next = cond_list_prev + [cond_next]
 
         return split_logits, cond_list_next, 0.0
 
@@ -233,9 +245,15 @@ class OctSplitGenerator(nn.Module):
         # grow octree with predicted split
         octree = seq2octree(octree, split_pred, self.depth, self.depth + 1)
 
-        # unpool features to next depth
+        # Unpool current and previous split-level features to next depth.
+        cond_list_prev = []
+        if self.propagate_cond_context:
+            cond_list_prev = [
+                octree_copy_unpool(cond, octree, self.depth, nempty=False)
+                for cond in cond_list
+            ]
         cond_next = octree_copy_unpool(features, octree, self.depth, nempty=False)
-        cond_list_next = [cond_next]
+        cond_list_next = cond_list_prev + [cond_next]
 
         # recurse to next level (pass grown octree forward)
         return next_level_sample_function(cond_list=cond_list_next, octree=octree)

@@ -29,11 +29,20 @@ class OctFractalGen(nn.Module):
         use_swin=True,
         use_checkpoint=True,
         vq_mask_ratio_min=0.5,
+        vq_mask_ratio_max=1.0,
+        vq_mask_ratio_loc=1.0,
+        vq_mask_ratio_scale=0.25,
         vq_random_flip=0.1,
         vq_remask_stage=0.7,
         vq_remask_prob=0.1,
         vq_loss_weight=1.0,
         vq_denoise_weight=0.3,
+        vq_loss_mode="masked",
+        vq_label_smoothing=0.0,
+        vq_mask_loss_weight=2.0,
+        vq_reveal_loss_weight=0.5,
+        vq_bit_weight_mode="uniform",
+        vq_bit_weight_ema_decay=0.99,
         fractal_level=0,
     ):
         super().__init__()
@@ -75,6 +84,7 @@ class OctFractalGen(nn.Module):
             proj_dropout=proj_dropout,
             full_depth=full_depth,
             max_depth=max_depth,
+            propagate_cond_context=fractal_level > 0,
         )
 
         # ----------------------------------------------------------------------
@@ -97,11 +107,20 @@ class OctFractalGen(nn.Module):
                 use_swin=use_swin,
                 use_checkpoint=use_checkpoint,
                 vq_mask_ratio_min=vq_mask_ratio_min,
+                vq_mask_ratio_max=vq_mask_ratio_max,
+                vq_mask_ratio_loc=vq_mask_ratio_loc,
+                vq_mask_ratio_scale=vq_mask_ratio_scale,
                 vq_random_flip=vq_random_flip,
                 vq_remask_stage=vq_remask_stage,
                 vq_remask_prob=vq_remask_prob,
                 vq_loss_weight=vq_loss_weight,
                 vq_denoise_weight=vq_denoise_weight,
+                vq_loss_mode=vq_loss_mode,
+                vq_label_smoothing=vq_label_smoothing,
+                vq_mask_loss_weight=vq_mask_loss_weight,
+                vq_reveal_loss_weight=vq_reveal_loss_weight,
+                vq_bit_weight_mode=vq_bit_weight_mode,
+                vq_bit_weight_ema_decay=vq_bit_weight_ema_decay,
                 fractal_level=fractal_level + 1,
             )
         else:
@@ -123,13 +142,23 @@ class OctFractalGen(nn.Module):
                 attn_dropout=attn_dropout,
                 proj_dropout=proj_dropout,
                 mask_ratio_min=vq_mask_ratio_min,
+                mask_ratio_max=vq_mask_ratio_max,
+                mask_ratio_loc=vq_mask_ratio_loc,
+                mask_ratio_scale=vq_mask_ratio_scale,
                 random_flip=vq_random_flip,
                 remask_stage=vq_remask_stage,
                 remask_prob=vq_remask_prob,
                 loss_weight=vq_loss_weight,
                 denoise_weight=vq_denoise_weight,
+                loss_mode=vq_loss_mode,
+                label_smoothing=vq_label_smoothing,
+                mask_loss_weight=vq_mask_loss_weight,
+                reveal_loss_weight=vq_reveal_loss_weight,
+                bit_weight_mode=vq_bit_weight_mode,
+                bit_weight_ema_decay=vq_bit_weight_ema_decay,
                 full_depth=full_depth,
                 max_depth=max_depth,
+                cond_embed_dims=embed_dim_list[:fractal_level + 1],
             )
 
     def forward(self, octree, cond_list=None, targets=None):
@@ -138,7 +167,8 @@ class OctFractalGen(nn.Module):
 
         Args:
             octree: GT octree (depth=8, full_depth=3)
-            cond_list: list of parent feature tensors; None at level 0
+            cond_list: list of split feature tensors aligned to current depth;
+                None at level 0
             targets: dict with 'split' (list per intermediate level) and
                      'vq' (terminal level target)
         Returns:
@@ -190,7 +220,8 @@ class OctFractalGen(nn.Module):
         Generate samples recursively (coarse-to-fine).
 
         Args:
-            cond_list: parent feature tensors; None at level 0
+            cond_list: split feature tensors aligned to current depth;
+                None at level 0
             octree: growing octree (mutated during sampling)
             vqvae: frozen pretrained VQVAE for terminal decoding
             num_iter_list: MAR iterations per level

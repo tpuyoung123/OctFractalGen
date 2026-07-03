@@ -25,8 +25,11 @@ from models.octfractalgen import (
     octfractalgen_shapenet_vqstrong,
     octfractalgen_small,
 )
+from models.oct_vq_gen import OctVQGenerator
 from models.vae_loader import build_vqvae
+from utils.metrics import format_focus_metrics
 from utils.utils import octree2seq
+from utils.lr_sched import adjust_learning_rate
 
 
 # ---------------------------------------------------------------------------
@@ -164,36 +167,6 @@ def extract_targets(octree, vqvae, full_depth=3, depth_stop=6, device="cuda"):
     return {"split": splits, "vq": vq_indices.to(device), "vq_zq": vq_zq.to(device)}
 
 
-# ---------------------------------------------------------------------------
-# LR scheduler (FractalGen-style per-iteration cosine with linear warmup)
-# ---------------------------------------------------------------------------
-def adjust_learning_rate(
-    optimizer, current_epoch, base_lr, min_lr, warmup_epochs, total_epochs
-):
-    """Per-iteration cosine schedule with linear warmup.
-
-    Args:
-        current_epoch: float, fractional epoch (epoch + step/total_steps)
-        base_lr: peak learning rate after warmup
-        min_lr: minimum learning rate at the end
-        warmup_epochs: number of linear warmup epochs
-        total_epochs: total number of training epochs
-    """
-    if current_epoch < warmup_epochs:
-        # linear warmup from 0 to base_lr
-        lr = base_lr * current_epoch / warmup_epochs
-    else:
-        # cosine decay from base_lr to min_lr
-        progress = (current_epoch - warmup_epochs) / max(
-            total_epochs - warmup_epochs, 1
-        )
-        progress = min(max(progress, 0.0), 1.0)
-        lr = min_lr + (base_lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
-    for pg in optimizer.param_groups:
-        pg["lr"] = lr
-    return lr
-
-
 def count_module_params(model, class_name):
     total = 0
     trainable = 0
@@ -228,6 +201,12 @@ def train_one_epoch(
     grad_clip=3.0,
 ):
     model.train()
+    # VQVAE stays frozen for the entire training: force eval mode and
+    # requires_grad=False every iteration to guard against any accidental
+    # state mutation (e.g. by model.train() recursion or external hooks).
+    vqvae.eval()
+    for p in vqvae.parameters():
+        p.requires_grad = False
     total_loss = 0.0
     total_split_loss = 0.0
     total_vq_loss = 0.0
@@ -299,11 +278,7 @@ def train_one_epoch(
                 if torch.cuda.is_available()
                 else 0
             )
-            # current-step metrics (instantaneous)
-            inst_metrics = " ".join(
-                f"{k} {v.item() if torch.is_tensor(v) else v:.3f}"
-                for k, v in metrics.items()
-            )
+            inst_metrics = format_focus_metrics(metrics)
             print(
                 f"  [ep {epoch}] iter {it + 1}/{len(dataloader)} | "
                 f"loss {loss.item():.4f} avg {avg:.4f} | "
@@ -391,6 +366,12 @@ def main():
         help="Minimum MAR mask ratio for VQ prediction",
     )
     parser.add_argument(
+        "--vq_mask_ratio_max",
+        type=float,
+        default=1.0,
+        help="Maximum MAR mask ratio for VQ prediction",
+    )
+    parser.add_argument(
         "--vq_random_flip",
         type=float,
         default=0.1,
@@ -413,6 +394,71 @@ def main():
         type=float,
         default=0.3,
         help="Weight for denoising loss on flipped non-masked VQ positions (0=disabled)",
+    )
+    parser.add_argument(
+        "--p0",
+        action="store_true",
+        default=False,
+        help="Enable P0 recipe: all_weighted loss + batch_var_ema weighting + "
+        "label_smoothing 0.1 + mask schedule loc=0.7/scale=0.2/min=0.3/max=1.0 "
+        "+ denoise off + vq_loss_weight 4.0. VQ remains trainable by default.",
+    )
+    parser.add_argument(
+        "--vq_loss_mode",
+        choices=["masked", "all_weighted"],
+        default="masked",
+        help="VQ loss mode: 'masked' (legacy, only masked positions) or "
+        "'all_weighted' (CE on all positions, mask/reveal weighted).",
+    )
+    parser.add_argument(
+        "--vq_label_smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing for VQ CE loss (0=disabled).",
+    )
+    parser.add_argument(
+        "--vq_mask_loss_weight",
+        type=float,
+        default=2.0,
+        help="In 'all_weighted' mode, loss weight for masked positions.",
+    )
+    parser.add_argument(
+        "--vq_reveal_loss_weight",
+        type=float,
+        default=0.5,
+        help="In 'all_weighted' mode, loss weight for revealed positions.",
+    )
+    parser.add_argument(
+        "--vq_bit_weight",
+        choices=["uniform", "batch_var", "batch_var_ema"],
+        default="uniform",
+        help="Per-bit loss weighting. batch_var_ema is the recommended stable "
+        "variant for improving masked VQ accuracy.",
+    )
+    parser.add_argument(
+        "--vq_bit_weight_ema_decay",
+        type=float,
+        default=0.99,
+        help="EMA decay for --vq_bit_weight batch_var_ema.",
+    )
+    parser.add_argument(
+        "--vq_mask_ratio_loc",
+        type=float,
+        default=1.0,
+        help="MAR mask ratio truncnorm loc (OctGPT default 1.0).",
+    )
+    parser.add_argument(
+        "--vq_mask_ratio_scale",
+        type=float,
+        default=0.25,
+        help="MAR mask ratio truncnorm scale (OctGPT default 0.25).",
+    )
+    parser.add_argument(
+        "--freeze_vq_epochs",
+        type=int,
+        default=0,
+        help="Two-stage training: freeze L3 OctVQGenerator for first N "
+        "epochs, then unfreeze. 0=disabled; usually keep disabled for VQAcc.",
     )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=2)
@@ -441,6 +487,53 @@ def main():
     parser.add_argument("--log_interval", type=int, default=20)
     args = parser.parse_args()
 
+    def cli_has_option(*option_names):
+        for arg in sys.argv[1:]:
+            for name in option_names:
+                if arg == name or arg.startswith(name + "="):
+                    return True
+        return False
+
+    def apply_p0_default(arg_name, value, *option_names):
+        if not cli_has_option(*option_names):
+            setattr(args, arg_name, value)
+
+    # ---- P0 recipe defaults: keep user-specified CLI values intact ----
+    if args.p0:
+        apply_p0_default("vq_loss_mode", "all_weighted", "--vq_loss_mode")
+        apply_p0_default("vq_label_smoothing", 0.1, "--vq_label_smoothing")
+        apply_p0_default("vq_mask_loss_weight", 2.0, "--vq_mask_loss_weight")
+        apply_p0_default("vq_reveal_loss_weight", 0.5, "--vq_reveal_loss_weight")
+        apply_p0_default("vq_bit_weight", "batch_var_ema", "--vq_bit_weight")
+        apply_p0_default("vq_bit_weight_ema_decay", 0.99, "--vq_bit_weight_ema_decay")
+        apply_p0_default("vq_mask_ratio_loc", 0.7, "--vq_mask_ratio_loc")
+        apply_p0_default("vq_mask_ratio_scale", 0.2, "--vq_mask_ratio_scale")
+        apply_p0_default("vq_mask_ratio_min", 0.3, "--vq_mask_ratio_min")
+        apply_p0_default("vq_mask_ratio_max", 1.0, "--vq_mask_ratio_max")
+        apply_p0_default("vq_denoise_weight", 0.0, "--vq_denoise_weight")
+        apply_p0_default("vq_loss_weight", 4.0, "--vq_loss_weight")
+        apply_p0_default("freeze_vq_epochs", 0, "--freeze_vq_epochs")
+        print(">> P0 recipe ENABLED. Defaults applied where CLI did not override.")
+
+    # normalize legacy -1 to disabled
+    if args.freeze_vq_epochs < 0:
+        args.freeze_vq_epochs = 0
+
+    if not (0.0 <= args.vq_mask_ratio_min < args.vq_mask_ratio_max <= 1.0):
+        raise ValueError("--vq_mask_ratio_min/max must satisfy 0 <= min < max <= 1")
+    if args.vq_mask_ratio_scale <= 0.0:
+        raise ValueError("--vq_mask_ratio_scale must be > 0")
+    if not (0.0 <= args.vq_mask_ratio_loc <= 1.0):
+        raise ValueError("--vq_mask_ratio_loc must be in [0, 1]")
+    if not (0.0 <= args.vq_label_smoothing < 1.0):
+        raise ValueError("--vq_label_smoothing must be in [0, 1)")
+    if args.vq_mask_loss_weight < 0.0 or args.vq_reveal_loss_weight < 0.0:
+        raise ValueError("--vq_mask/reveal_loss_weight must be non-negative")
+    if args.vq_mask_loss_weight == 0.0 and args.vq_reveal_loss_weight == 0.0:
+        raise ValueError("At least one VQ position loss weight must be > 0")
+    if not (0.0 <= args.vq_bit_weight_ema_decay < 1.0):
+        raise ValueError("--vq_bit_weight_ema_decay must be in [0, 1)")
+
     os.makedirs(args.logdir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
@@ -459,11 +552,20 @@ def main():
     print("Building OctFractalGen ...")
     model_kwargs = dict(
         vq_mask_ratio_min=args.vq_mask_ratio_min,
+        vq_mask_ratio_max=args.vq_mask_ratio_max,
+        vq_mask_ratio_loc=args.vq_mask_ratio_loc,
+        vq_mask_ratio_scale=args.vq_mask_ratio_scale,
         vq_random_flip=args.vq_random_flip,
         vq_remask_stage=args.vq_remask_stage,
         vq_remask_prob=args.vq_remask_prob,
         vq_loss_weight=args.vq_loss_weight,
         vq_denoise_weight=args.vq_denoise_weight,
+        vq_loss_mode=args.vq_loss_mode,
+        vq_label_smoothing=args.vq_label_smoothing,
+        vq_mask_loss_weight=args.vq_mask_loss_weight,
+        vq_reveal_loss_weight=args.vq_reveal_loss_weight,
+        vq_bit_weight_mode=args.vq_bit_weight,
+        vq_bit_weight_ema_decay=args.vq_bit_weight_ema_decay,
     )
     if args.model == "shapenet":
         model = octfractalgen_shapenet(**model_kwargs)
@@ -529,6 +631,54 @@ def main():
         start_epoch = ck["epoch"] + 1
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
+    # ---- Optional two-stage training: identify L3 VQ params for freeze/unfreeze ----
+    vq_params = [
+        p
+        for m in model.modules()
+        if isinstance(m, OctVQGenerator)
+        for p in m.parameters()
+    ]
+    vq_frozen = False
+    if args.freeze_vq_epochs > 0:
+        print(
+            f"  Two-stage training: L3 VQ generator frozen for first "
+            f"{args.freeze_vq_epochs} epochs, then unfrozen. "
+            f"VQ params: {sum(p.numel() for p in vq_params) / 1e6:.2f}M"
+        )
+        if start_epoch < args.freeze_vq_epochs:
+            for p in vq_params:
+                p.requires_grad = False
+            vq_frozen = True
+            print(f"  >> VQ frozen at start (epoch {start_epoch})")
+
+    # ---- Best-metric tracking (load existing bests if present) ----
+    best_split_acc = -1.0
+    best_vq_acc = -1.0
+    best_vq_metric_name = "avg_vq_top5_acc"
+    for ckpt_name, attr in (
+        ("best_split.pth", "best_split_acc"),
+        ("best_vq.pth", "best_vq_acc"),
+    ):
+        ckpt_file = os.path.join(args.logdir, ckpt_name)
+        if os.path.exists(ckpt_file):
+            try:
+                bck = torch.load(ckpt_file, weights_only=True, map_location="cpu")
+                if attr in bck:
+                    if attr == "best_split_acc":
+                        best_split_acc = bck[attr]
+                    elif bck.get("best_vq_metric_name") == best_vq_metric_name:
+                        best_vq_acc = bck[attr]
+                    else:
+                        old_name = bck.get("best_vq_metric_name", "legacy")
+                        print(
+                            f"Ignore {ckpt_name} best_vq_acc from {old_name}; "
+                            f"current metric is {best_vq_metric_name}."
+                        )
+                        continue
+                    print(f"Loaded {attr} = {bck[attr]:.4f} from {ckpt_name}")
+            except Exception as e:
+                print(f"Warn: failed to load {ckpt_name}: {e}")
+
     # ---- Dataset ----
     cache_dir = None
     if args.cache:
@@ -561,6 +711,17 @@ def main():
     history = []
     print(f"\n=== Training started: {args.epochs} epochs ===\n")
     for epoch in range(start_epoch, args.epochs):
+        # Optional two-stage: unfreeze VQ generator when entering stage B
+        if args.freeze_vq_epochs > 0 and vq_frozen and epoch >= args.freeze_vq_epochs:
+            for p in vq_params:
+                p.requires_grad = True
+            vq_frozen = False
+            n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(
+                f">> Epoch {epoch}: Unfreezing VQ generator (stage B). "
+                f"Trainable params: {n_tr / 1e6:.2f}M"
+            )
+
         stats = train_one_epoch(
             model,
             vqvae,
@@ -581,10 +742,7 @@ def main():
         )
 
         lr = optimizer.param_groups[0]["lr"]
-        # format avg metrics for epoch summary
-        avg_metric_str = " ".join(
-            f"{k} {v:.3f}" for k, v in stats.items() if k.startswith("avg_")
-        )
+        avg_metric_str = format_focus_metrics(stats)
         print(
             f"Epoch {epoch} done | loss {stats['loss']:.4f} | "
             f"{avg_metric_str} | "
@@ -592,6 +750,13 @@ def main():
         )
 
         history.append({"epoch": epoch, **stats, "lr": lr})
+
+        # ---- compute current epoch metrics for best-tracking ----
+        split_keys = [k for k in stats if k.startswith("avg_split_acc_l")]
+        cur_split_acc = (
+            sum(stats[k] for k in split_keys) / len(split_keys) if split_keys else 0.0
+        )
+        cur_vq_acc = stats.get(best_vq_metric_name, stats.get("avg_vq_top5_acc", 0.0))
 
         # checkpoint
         ckpt_path = os.path.join(args.logdir, "latest.pth")
@@ -618,6 +783,41 @@ def main():
                     "args": vars(args),
                 },
                 ep_path,
+            )
+
+        # best-split checkpoint (average of L0/L1/L2 split accuracy)
+        if cur_split_acc > best_split_acc:
+            best_split_acc = cur_split_acc
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "args": vars(args),
+                    "best_split_acc": best_split_acc,
+                },
+                os.path.join(args.logdir, "best_split.pth"),
+            )
+            print(f"  >> New best split_acc: {best_split_acc:.4f} -> best_split.pth")
+
+        # best-vq checkpoint
+        if cur_vq_acc > best_vq_acc:
+            best_vq_acc = cur_vq_acc
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "args": vars(args),
+                    "best_vq_acc": best_vq_acc,
+                    "best_vq_metric_name": best_vq_metric_name,
+                },
+                os.path.join(args.logdir, "best_vq.pth"),
+            )
+            print(
+                f"  >> New best {best_vq_metric_name}: {best_vq_acc:.4f} -> best_vq.pth"
             )
 
         # save history
