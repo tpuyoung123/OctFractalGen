@@ -439,6 +439,27 @@ def main():
         help="EMA decay for --vq_bit_weight batch_var_ema.",
     )
     parser.add_argument(
+        "--vq_use_bit_pos_emb",
+        action="store_true",
+        default=False,
+        help="Add learnable bit-position embedding to VQ tokens so the model "
+        "can distinguish BSQ bit indices (high vs low-order bits).",
+    )
+    parser.add_argument(
+        "--vq_cond_injection",
+        choices=["add", "film", "cross_attn"],
+        default="add",
+        help="Condition injection mode in the VQ generator. 'add' (legacy "
+        "bias), 'film' (gamma/beta modulation), 'cross_attn' "
+        "(cross-attention Q=vq_tokens K=V=cond).",
+    )
+    parser.add_argument(
+        "--vq_cond_cross_attn_heads",
+        type=int,
+        default=4,
+        help="Number of attention heads for --vq_cond_injection cross_attn.",
+    )
+    parser.add_argument(
         "--vq_mask_ratio_loc",
         type=float,
         default=1.0,
@@ -510,6 +531,9 @@ def main():
         apply_p0_default("vq_denoise_weight", 0.0, "--vq_denoise_weight")
         apply_p0_default("vq_loss_weight", 4.0, "--vq_loss_weight")
         apply_p0_default("freeze_vq_epochs", 0, "--freeze_vq_epochs")
+        # P1/P2 enhancements (on top of P0 loss/mask recipe)
+        apply_p0_default("vq_use_bit_pos_emb", True, "--vq_use_bit_pos_emb")
+        apply_p0_default("vq_cond_injection", "film", "--vq_cond_injection")
         print(">> P0 recipe ENABLED. Defaults applied where CLI did not override.")
 
     # normalize legacy -1 to disabled
@@ -563,6 +587,9 @@ def main():
         vq_reveal_loss_weight=args.vq_reveal_loss_weight,
         vq_bit_weight_mode=args.vq_bit_weight,
         vq_bit_weight_ema_decay=args.vq_bit_weight_ema_decay,
+        vq_use_bit_pos_emb=args.vq_use_bit_pos_emb,
+        vq_cond_injection=args.vq_cond_injection,
+        vq_cond_cross_attn_heads=args.vq_cond_cross_attn_heads,
     )
     if args.model == "shapenet_vq120_b2":
         model = octfractalgen_shapenet_vq120_b2(

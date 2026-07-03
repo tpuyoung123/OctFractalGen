@@ -232,8 +232,13 @@ class OctSplitGenerator(nn.Module):
             else:
                 mask_to_pred = mask ^ mask_next
 
+            # OctGPT-style linear temperature decay:
+            # temperature = start_temperature * ((num_iter - step) / num_iter)
+            # so sampling is diverse early and sharpens to argmax at the end.
+            cur_temperature = temperature * ((num_iter - step) / num_iter)
+
             # sample and update only the positions revealed this step
-            sampled = sample(split_logits[mask_to_pred], temperature=temperature)
+            sampled = sample(split_logits[mask_to_pred], temperature=cur_temperature)
             split_pred[mask_to_pred] = sampled.long()
 
             mask = mask_next

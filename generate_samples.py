@@ -31,7 +31,6 @@ import ocnn
 from ocnn.octree import Octree
 
 from models.octfractalgen import (
-    octfractalgen_shapenet,
     octfractalgen_shapenet_vq120_b2,
     octfractalgen_shapenet_vq240_b4,
     octfractalgen_shapenet_vq384_b8,
@@ -39,8 +38,6 @@ from models.octfractalgen import (
     octfractalgen_shapenet_vq576_b8,
     octfractalgen_shapenet_vq576_b12,
     octfractalgen_shapenet_vq576_b16,
-    octfractalgen_shapenet_vqstrong,
-    octfractalgen_small,
 )
 from models.vae_loader import build_vqvae
 from utils import utils as octgpt_utils
@@ -105,20 +102,21 @@ def main():
         type=str,
         default='shapenet_vq576_b12',
         choices=[
-            'shapenet',
-            'shapenet_vqstrong',
             'shapenet_vq120_b2',
             'shapenet_vq240_b4',
             'shapenet_vq384_b8',
             'shapenet_vq384_b16',
             'shapenet_vq576_b8',
             'shapenet_vq576_b12',
-            'shapenet_vq576_b16',
-            'small'])
+            'shapenet_vq576_b16'])
     parser.add_argument('--num_samples', type=int, default=8)
     parser.add_argument('--resolution', type=int, default=256)
     parser.add_argument('--sdf_scale', type=float, default=0.9)
-    parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--temperature', type=float, nargs='+', default=[1.0, 1.2, 0.5, 0.5],
+                        help='Sampling start temperature per fractal level '
+                             '(OctGPT convention: [L0, L1, L2, L3]). Each level '
+                             'linearly decays from this value to 0 across its '
+                             'MAR iterations. A single value is broadcast to all levels.')
     parser.add_argument('--num_iters', type=int, nargs='+', default=[64, 128, 128, 256],
                         help='MAR iterations per fractal level (4 levels)')
     parser.add_argument('--seed', type=int, default=0)
@@ -139,39 +137,66 @@ def main():
         freeze=True,
     )
 
-    # ---- Model ----
-    print('Building OctFractalGen ...')
-    if args.model == 'shapenet':
-        model = octfractalgen_shapenet()
-    elif args.model == 'shapenet_vqstrong':
-        model = octfractalgen_shapenet_vqstrong()
-    elif args.model == 'shapenet_vq120_b2':
-        model = octfractalgen_shapenet_vq120_b2()
-    elif args.model == 'shapenet_vq240_b4':
-        model = octfractalgen_shapenet_vq240_b4()
-    elif args.model == 'shapenet_vq384_b8':
-        model = octfractalgen_shapenet_vq384_b8()
-    elif args.model == 'shapenet_vq384_b16':
-        model = octfractalgen_shapenet_vq384_b16()
-    elif args.model == 'shapenet_vq576_b8':
-        model = octfractalgen_shapenet_vq576_b8()
-    elif args.model == 'shapenet_vq576_b12':
-        model = octfractalgen_shapenet_vq576_b12()
-    elif args.model == 'shapenet_vq576_b16':
-        model = octfractalgen_shapenet_vq576_b16()
-    else:
-        model = octfractalgen_small()
-    model.to(device)
-
-    # ---- Load checkpoint ----
+    # ---- Load checkpoint first to read training args (model config) ----
     print(f'Loading checkpoint: {args.ckpt}')
     ck = torch.load(args.ckpt, weights_only=True, map_location='cpu')
+    ck_args = ck.get('args', {})
+    # Use ck_args model if --model not explicitly set or matches
+    ck_model = ck_args.get('model', args.model)
+    if ck_model != args.model:
+        print(f'  Note: checkpoint model={ck_model}, CLI --model={args.model}; using checkpoint model.')
+        args.model = ck_model
+
+    # Build model kwargs from checkpoint args for VQ enhancements.
+    # Detect actual state_dict keys to stay robust against old checkpoints
+    # that predate the bit_pos_emb / cond_injection features.
+    sd_keys = set(ck['model'].keys())
+    has_bit_pos_emb = any(k.endswith('.bit_pos_emb') for k in sd_keys)
+    has_film = any('.film.' in k for k in sd_keys)
+    has_cross_attn = any('.cond_cross_attn.' in k for k in sd_keys)
+    model_kwargs = {}
+    model_kwargs['vq_use_bit_pos_emb'] = has_bit_pos_emb
+    if has_film:
+        model_kwargs['vq_cond_injection'] = 'film'
+    elif has_cross_attn:
+        model_kwargs['vq_cond_injection'] = 'cross_attn'
+    else:
+        model_kwargs['vq_cond_injection'] = 'add'
+    print(f'  Detected from state_dict: bit_pos_emb={has_bit_pos_emb}, '
+          f'cond_injection={model_kwargs["vq_cond_injection"]}')
+
+    # ---- Model ----
+    print('Building OctFractalGen ...')
+    if args.model == 'shapenet_vq120_b2':
+        model = octfractalgen_shapenet_vq120_b2(**model_kwargs)
+    elif args.model == 'shapenet_vq240_b4':
+        model = octfractalgen_shapenet_vq240_b4(**model_kwargs)
+    elif args.model == 'shapenet_vq384_b8':
+        model = octfractalgen_shapenet_vq384_b8(**model_kwargs)
+    elif args.model == 'shapenet_vq384_b16':
+        model = octfractalgen_shapenet_vq384_b16(**model_kwargs)
+    elif args.model == 'shapenet_vq576_b8':
+        model = octfractalgen_shapenet_vq576_b8(**model_kwargs)
+    elif args.model == 'shapenet_vq576_b12':
+        model = octfractalgen_shapenet_vq576_b12(**model_kwargs)
+    else:  # shapenet_vq576_b16
+        model = octfractalgen_shapenet_vq576_b16(**model_kwargs)
+    model.to(device)
+
     model.load_state_dict(ck['model'])
     model.eval()
     epoch = ck.get('epoch', '?')
     print(f'  Loaded (epoch {epoch})')
 
     num_iters_list = args.num_iters  # per fractal level
+
+    # Normalize temperature: single value -> broadcast to 4 levels;
+    # list stays as-is (OctGPT convention [L0, L1, L2, L3]).
+    if len(args.temperature) == 1:
+        temperature = args.temperature[0]
+    else:
+        temperature = args.temperature
+    print(f'  Temperature: {temperature}')
 
     print(f'\n=== Generating {args.num_samples} samples ===')
     if args.raw_octree:
@@ -187,7 +212,7 @@ def main():
                 model, vqvae, device,
                 full_depth=3, depth=8, depth_stop=6,
                 num_iters_list=num_iters_list,
-                temperature=args.temperature,
+                temperature=temperature,
                 return_raw_octree=args.raw_octree)
             elapsed = __import__('time').time() - t0
 

@@ -78,7 +78,9 @@ class OctVQGenerator(nn.Module):
                  mask_loss_weight=2.0, reveal_loss_weight=0.5,
                  bit_weight_mode="uniform", bit_weight_ema_decay=0.99,
                  full_depth=3, max_depth=8,
-                 cond_embed_dims=None):
+                 cond_embed_dims=None,
+                 use_bit_pos_emb=True, cond_injection="add",
+                 cond_cross_attn_heads=4):
         super().__init__()
         if not (0.0 <= mask_ratio_min < mask_ratio_max <= 1.0):
             raise ValueError(
@@ -108,6 +110,16 @@ class OctVQGenerator(nn.Module):
             if cond_embed_dims[-1] != cond_embed_dim:
                 raise ValueError(
                     "cond_embed_dims[-1] must match cond_embed_dim")
+        if cond_injection not in ("add", "film", "cross_attn"):
+            raise ValueError(
+                f"Unknown cond_injection mode: {cond_injection!r}; "
+                "expected one of 'add', 'film', 'cross_attn'")
+        if cond_injection == "cross_attn" and cond_cross_attn_heads <= 0:
+            raise ValueError("cond_cross_attn_heads must be > 0 for cross_attn")
+        if cond_injection == "cross_attn" and embed_dim % cond_cross_attn_heads != 0:
+            raise ValueError(
+                f"embed_dim ({embed_dim}) must be divisible by "
+                f"cond_cross_attn_heads ({cond_cross_attn_heads})")
 
         self.depth = depth                 # terminal depth, e.g. 6
         self.embed_dim = embed_dim
@@ -132,6 +144,10 @@ class OctVQGenerator(nn.Module):
         self.bit_weight_ema_decay = bit_weight_ema_decay
         self.cond_embed_dims = cond_embed_dims
         self.cond_context_scale = len(cond_embed_dims) ** -0.5
+        # P1.2/1.3: condition injection mode and bit position embedding
+        self.use_bit_pos_emb = bool(use_bit_pos_emb)
+        self.cond_injection = cond_injection
+        self.cond_cross_attn_heads = cond_cross_attn_heads
         self.register_buffer(
             "bit_var_ema", torch.ones(vq_groups), persistent=False)
 
@@ -139,12 +155,38 @@ class OctVQGenerator(nn.Module):
         # For BSQ, zq is (-1/+1) / sqrt(32), matching OctGPT.
         self.vq_proj = nn.Linear(vq_groups, embed_dim)
 
+        # P2.8: bit position embedding so the model can distinguish BSQ bit
+        # indices (the 32 bits carry different geometric information: high
+        # vs low-order bits on the L2 sphere).
+        if self.use_bit_pos_emb:
+            self.bit_pos_emb = nn.Parameter(torch.zeros(vq_groups, embed_dim))
+        else:
+            self.bit_pos_emb = None
+
         # condition projections: multi-level split features -> current embed_dim
         self.extra_cond_projs = nn.ModuleList([
             nn.Linear(dim, embed_dim) for dim in cond_embed_dims[:-1]
         ])
         # Keep the direct-parent projection name stable for old diagnostics.
         self.cond_proj = nn.Linear(cond_embed_dim, embed_dim)
+
+        # P1.2/1.3: condition injection modules.
+        #   "add":      x = vq_proj(codes) + cond           (legacy)
+        #   "film":     x = vq_proj(codes) * (1+gamma) + beta
+        #   "cross_attn": x = CrossAttn(Q=vq_tokens, K=V=cond)
+        if self.cond_injection == "film":
+            self.film = nn.Sequential(
+                nn.Linear(embed_dim, 2 * embed_dim),
+                nn.GELU(),
+                nn.Linear(2 * embed_dim, 2 * embed_dim),
+            )
+        else:
+            self.film = None
+        if self.cond_injection == "cross_attn":
+            self.cond_cross_attn = nn.MultiheadAttention(
+                embed_dim, cond_cross_attn_heads, batch_first=True)
+        else:
+            self.cond_cross_attn = None
 
         # mask token for MAR (unrevealed positions)
         self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
@@ -172,6 +214,8 @@ class OctVQGenerator(nn.Module):
 
     def _init_weights(self):
         nn.init.normal_(self.mask_token, std=0.02)
+        if self.bit_pos_emb is not None:
+            nn.init.normal_(self.bit_pos_emb, std=0.02)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -269,11 +313,38 @@ class OctVQGenerator(nn.Module):
         cond = cond * context_scale
 
         vq_codes = vq_codes.to(dtype=cond.dtype)
-        x = self.vq_proj(vq_codes) + cond                    # (N_d, E) token + cond
+        vq_tokens = self.vq_proj(vq_codes)                 # (N_d, E)
+        if self.bit_pos_emb is not None:
+            # bit_pos_emb: (vq_groups, E). Aggregate per-bit position
+            # priors weighted by the code value, producing a (N_d, E)
+            # additive embedding that distinguishes bit indices.
+            vq_tokens = vq_tokens + torch.matmul(
+                vq_codes, self.bit_pos_emb)
 
-        if mask is not None:
-            masked_x = self.mask_token.to(x.dtype) + cond
-            x = torch.where(mask.unsqueeze(1), masked_x, x)
+        # Condition injection: add (legacy) / FiLM / cross-attention.
+        if self.cond_injection == "add":
+            x = vq_tokens + cond
+            if mask is not None:
+                masked_x = self.mask_token.to(x.dtype) + cond
+                x = torch.where(mask.unsqueeze(1), masked_x, x)
+        elif self.cond_injection == "film":
+            gamma, beta = self.film(cond).chunk(2, dim=-1)
+            x = vq_tokens * (1.0 + gamma) + beta
+            if mask is not None:
+                masked_x = self.mask_token.to(x.dtype) * (1.0 + gamma) + beta
+                x = torch.where(mask.unsqueeze(1), masked_x, x)
+        else:  # cross_attn
+            # Q = vq_tokens (revealed) or mask_token (masked); K = V = cond.
+            x_query = vq_tokens
+            if mask is not None:
+                masked_query = self.mask_token.to(x_query.dtype)
+                x_query = torch.where(
+                    mask.unsqueeze(1), masked_query, x_query)
+            # nn.MultiheadAttention expects (N, E) -> (1, N, E)
+            x_attn, _ = self.cond_cross_attn(
+                x_query.unsqueeze(0), cond.unsqueeze(0), cond.unsqueeze(0),
+                need_weights=False)
+            x = x_attn.squeeze(0)
 
         # Build OctreeT for windowed attention at this depth
         nnum_d = x.shape[0]

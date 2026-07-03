@@ -43,6 +43,9 @@ class OctFractalGen(nn.Module):
         vq_reveal_loss_weight=0.5,
         vq_bit_weight_mode="uniform",
         vq_bit_weight_ema_decay=0.99,
+        vq_use_bit_pos_emb=True,
+        vq_cond_injection="add",
+        vq_cond_cross_attn_heads=4,
         fractal_level=0,
     ):
         super().__init__()
@@ -121,6 +124,9 @@ class OctFractalGen(nn.Module):
                 vq_reveal_loss_weight=vq_reveal_loss_weight,
                 vq_bit_weight_mode=vq_bit_weight_mode,
                 vq_bit_weight_ema_decay=vq_bit_weight_ema_decay,
+                vq_use_bit_pos_emb=vq_use_bit_pos_emb,
+                vq_cond_injection=vq_cond_injection,
+                vq_cond_cross_attn_heads=vq_cond_cross_attn_heads,
                 fractal_level=fractal_level + 1,
             )
         else:
@@ -159,6 +165,9 @@ class OctFractalGen(nn.Module):
                 full_depth=full_depth,
                 max_depth=max_depth,
                 cond_embed_dims=embed_dim_list[: fractal_level + 1],
+                use_bit_pos_emb=vq_use_bit_pos_emb,
+                cond_injection=vq_cond_injection,
+                cond_cross_attn_heads=vq_cond_cross_attn_heads,
             )
 
     def forward(self, octree, cond_list=None, targets=None):
@@ -225,7 +234,11 @@ class OctFractalGen(nn.Module):
             octree: growing octree (mutated during sampling)
             vqvae: frozen pretrained VQVAE for terminal decoding
             num_iter_list: MAR iterations per level
-            temperature: sampling temperature
+            temperature: sampling temperature. Can be a scalar (applied to
+                all levels) or a list/tuple with one value per fractal level
+                (OctGPT convention: [1.0, 1.2, 0.5, 0.5] for the 4 levels).
+                Each level linearly decays from this start value to 0 across
+                its MAR iterations (OctGPT-style temperature decay).
             fractal_level: current fractal level
             return_raw_octree: if True, skip VQVAE decode at terminal level
                 and return (octree, vq_pred) at depth 6 instead of neural_mpu.
@@ -233,6 +246,14 @@ class OctFractalGen(nn.Module):
             neural_mpu callable from VQVAE decode (at terminal level), OR
             (octree, vq_pred) if return_raw_octree=True.
         """
+        # Per-level start temperature (OctGPT convention)
+        if isinstance(temperature, (list, tuple)):
+            cur_temperature = temperature[fractal_level]
+            child_temperature = temperature  # pass full list down
+        else:
+            cur_temperature = temperature
+            child_temperature = temperature
+
         if fractal_level == 0:
             # Unconditional: broadcast root_token
             nnum_root = octree.nnum[self.depth_list[0]]
@@ -246,7 +267,7 @@ class OctFractalGen(nn.Module):
                 self.next_fractal.sample,
                 vqvae=vqvae,
                 num_iter_list=num_iter_list,
-                temperature=temperature,
+                temperature=child_temperature,
                 fractal_level=fractal_level + 1,
                 return_raw_octree=return_raw_octree,
             )
@@ -256,11 +277,16 @@ class OctFractalGen(nn.Module):
             terminal_num_iter = (
                 None if num_iter_list is None else num_iter_list[fractal_level + 1]
             )
+            # Terminal VQ level uses its own start temperature
+            if isinstance(temperature, (list, tuple)):
+                terminal_temperature = temperature[fractal_level + 1]
+            else:
+                terminal_temperature = temperature
             next_level_sample_function = partial(
                 self.next_fractal.sample,
                 vqvae=vqvae,
                 num_iter=terminal_num_iter,
-                temperature=temperature,
+                temperature=terminal_temperature,
                 return_raw_octree=return_raw_octree,
             )
 
@@ -269,7 +295,7 @@ class OctFractalGen(nn.Module):
             cond_list,
             octree,
             num_iter_list[fractal_level],
-            temperature,
+            cur_temperature,
             next_level_sample_function,
             visualize,
         )
