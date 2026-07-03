@@ -94,7 +94,6 @@ def train_one_epoch(
     for p in vqvae.parameters():
         p.requires_grad = False
     total_loss = 0.0
-    total_split_loss = 0.0
     # metrics accumulators
     metric_sums = {}  # key -> float sum
     metric_counts = {}  # key -> int count
@@ -328,17 +327,6 @@ def main():
                     return True
         return False
 
-    def apply_p0_default(arg_name, value, *option_names):
-        if not cli_has_option(*option_names):
-            setattr(args, arg_name, value)
-
-    # ---- P1/P2 architectural enhancements: enabled via --p0 ----
-    if args.p0:
-        apply_p0_default("vq_use_bit_pos_emb", True, "--vq_use_bit_pos_emb")
-        apply_p0_default("vq_cond_injection", "film", "--vq_cond_injection")
-        print(">> P1/P2 enhancements ENABLED (bit_pos_emb + FiLM). "
-              "Loss follows OctGPT convention.")
-
     # normalize legacy -1 to disabled
     if args.freeze_vq_epochs < 0:
         args.freeze_vq_epochs = 0
@@ -351,14 +339,11 @@ def main():
     print(f"Device: {device}")
     print(f"Args: {vars(args)}")
 
-    # ---- VQVAE (frozen) ----
-    print("Loading pretrained VQVAE ...")
     vqvae = build_vqvae(
         args.vqvae_ckpt,
         device=device,
         freeze=True,
     )
-    print(f"VQVAE loaded and frozen.")
 
     # ---- Model ----
     print("Building OctFractalGen ...")
@@ -427,27 +412,7 @@ def main():
         start_epoch = ck["epoch"] + 1
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
-    # ---- Optional two-stage training: identify L3 VQ params for freeze/unfreeze ----
-    vq_params = [
-        p
-        for m in model.modules()
-        if isinstance(m, OctVQGenerator)
-        for p in m.parameters()
-    ]
-    vq_frozen = False
-    if args.freeze_vq_epochs > 0:
-        print(
-            f"  Two-stage training: L3 VQ generator frozen for first "
-            f"{args.freeze_vq_epochs} epochs, then unfrozen. "
-            f"VQ params: {sum(p.numel() for p in vq_params) / 1e6:.2f}M"
-        )
-        if start_epoch < args.freeze_vq_epochs:
-            for p in vq_params:
-                p.requires_grad = False
-            vq_frozen = True
-            print(f"  >> VQ frozen at start (epoch {start_epoch})")
-
-    # ---- Best-metric tracking (load existing bests if present) ----
+        # ---- Best-metric tracking (load existing bests if present) ----
     best_split_acc = -1.0
     best_vq_acc = -1.0
     best_vq_metric_name = "avg_vq_top5_acc"
@@ -507,17 +472,6 @@ def main():
     history = []
     print(f"\n=== Training started: {args.epochs} epochs ===\n")
     for epoch in range(start_epoch, args.epochs):
-        # Optional two-stage: unfreeze VQ generator when entering stage B
-        if args.freeze_vq_epochs > 0 and vq_frozen and epoch >= args.freeze_vq_epochs:
-            for p in vq_params:
-                p.requires_grad = True
-            vq_frozen = False
-            n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            print(
-                f">> Epoch {epoch}: Unfreezing VQ generator (stage B). "
-                f"Trainable params: {n_tr / 1e6:.2f}M"
-            )
-
         stats = train_one_epoch(
             model,
             vqvae,
