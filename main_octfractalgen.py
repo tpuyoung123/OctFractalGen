@@ -14,7 +14,6 @@ from torch.amp import autocast, GradScaler
 import ocnn
 from ocnn.octree import Octree, Points
 from models.octfractalgen import (
-    octfractalgen_shapenet,
     octfractalgen_shapenet_vq120_b2,
     octfractalgen_shapenet_vq240_b4,
     octfractalgen_shapenet_vq384_b8,
@@ -22,8 +21,6 @@ from models.octfractalgen import (
     octfractalgen_shapenet_vq576_b8,
     octfractalgen_shapenet_vq576_b12,
     octfractalgen_shapenet_vq576_b16,
-    octfractalgen_shapenet_vqstrong,
-    octfractalgen_small,
 )
 from models.oct_vq_gen import OctVQGenerator
 from models.vae_loader import build_vqvae
@@ -567,11 +564,7 @@ def main():
         vq_bit_weight_mode=args.vq_bit_weight,
         vq_bit_weight_ema_decay=args.vq_bit_weight_ema_decay,
     )
-    if args.model == "shapenet":
-        model = octfractalgen_shapenet(**model_kwargs)
-    elif args.model == "shapenet_vqstrong":
-        model = octfractalgen_shapenet_vqstrong(**model_kwargs)
-    elif args.model == "shapenet_vq120_b2":
+    if args.model == "shapenet_vq120_b2":
         model = octfractalgen_shapenet_vq120_b2(
             **model_kwargs,
         )
@@ -597,10 +590,6 @@ def main():
         )
     elif args.model == "shapenet_vq576_b16":
         model = octfractalgen_shapenet_vq576_b16(
-            **model_kwargs,
-        )
-    else:
-        model = octfractalgen_small(
             **model_kwargs,
         )
     model.to(device)

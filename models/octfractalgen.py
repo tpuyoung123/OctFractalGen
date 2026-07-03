@@ -158,7 +158,7 @@ class OctFractalGen(nn.Module):
                 bit_weight_ema_decay=vq_bit_weight_ema_decay,
                 full_depth=full_depth,
                 max_depth=max_depth,
-                cond_embed_dims=embed_dim_list[:fractal_level + 1],
+                cond_embed_dims=embed_dim_list[: fractal_level + 1],
             )
 
     def forward(self, octree, cond_list=None, targets=None):
@@ -431,31 +431,6 @@ def octfractalgen_shapenet_vq576_b16(**kwargs):
         num_heads_list=(8, 8, 4, 8),
         generator_type_list=("mar", "mar", "mar", "mar"),
         num_iters_list=(64, 128, 128, 256),
-        fractal_level=0,
-        **kwargs,
-    )
-    return model
-
-
-def octfractalgen_shapenet(**kwargs):
-    """Backward-compatible alias for the original ShapeNet model."""
-    return octfractalgen_shapenet_vq120_b2(**kwargs)
-
-
-def octfractalgen_shapenet_vqstrong(**kwargs):
-    """Backward-compatible alias for the first stronger VQ model."""
-    return octfractalgen_shapenet_vq240_b4(**kwargs)
-
-
-def octfractalgen_small(**kwargs):
-    """Smaller variant for fast experimentation (RoPE-compatible dims)."""
-    model = OctFractalGen(
-        depth_list=(3, 4, 5, 6),
-        embed_dim_list=(288, 192, 120, 72),
-        num_blocks_list=(8, 4, 2, 2),
-        num_heads_list=(8, 8, 4, 4),
-        generator_type_list=("mar", "mar", "mar", "mar"),
-        num_iters_list=(32, 64, 64, 128),
         fractal_level=0,
         **kwargs,
     )
