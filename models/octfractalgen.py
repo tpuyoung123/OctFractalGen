@@ -17,21 +17,21 @@ class OctFractalGen(nn.Module):
         embed_dim_list,
         num_blocks_list,
         num_heads_list,
-        generator_type_list,
         num_iters_list,
         attn_dropout=0.0,
         proj_dropout=0.1,
-        patch_size=1024,
+        patch_size=2048,
         dilation=2,
         use_swin=True,
         use_checkpoint=True,
         vq_mask_ratio_min=0.5,
-        vq_random_flip=0.0,
+        vq_random_flip=0.1,
         vq_remask_stage=0.7,
         vq_remask_prob=0.1,
         vq_use_bit_pos_emb=True,
-        vq_cond_injection="add",
+        vq_cond_injection="film",
         vq_cond_cross_attn_heads=4,
+        vq_loss_weight=1.0,
         fractal_level=0,
     ):
         super().__init__()
@@ -41,6 +41,7 @@ class OctFractalGen(nn.Module):
         self.depth_list = list(depth_list)
         self.fractal_level = fractal_level
         self.num_fractal_levels = len(depth_list)
+        self.vq_loss_weight = vq_loss_weight
 
         # ----------------------------------------------------------------------
         # Root token for the first fractal level (unconditional generation)
@@ -60,7 +61,6 @@ class OctFractalGen(nn.Module):
             else embed_dim_list[0],
             num_blocks=num_blocks_list[fractal_level],
             num_heads=num_heads_list[fractal_level],
-            generator_type=generator_type_list[fractal_level],
             patch_size=patch_size,
             dilation=dilation,
             use_swin=use_swin,
@@ -78,7 +78,6 @@ class OctFractalGen(nn.Module):
                 embed_dim_list=embed_dim_list,
                 num_blocks_list=num_blocks_list,
                 num_heads_list=num_heads_list,
-                generator_type_list=generator_type_list,
                 num_iters_list=num_iters_list,
                 attn_dropout=attn_dropout,
                 proj_dropout=proj_dropout,
@@ -93,6 +92,7 @@ class OctFractalGen(nn.Module):
                 vq_use_bit_pos_emb=vq_use_bit_pos_emb,
                 vq_cond_injection=vq_cond_injection,
                 vq_cond_cross_attn_heads=vq_cond_cross_attn_heads,
+                vq_loss_weight=vq_loss_weight,
                 fractal_level=fractal_level + 1,
             )
         else:
@@ -105,7 +105,6 @@ class OctFractalGen(nn.Module):
                 num_blocks=num_blocks_list[fractal_level + 1],
                 num_heads=num_heads_list[fractal_level + 1],
                 num_iters=num_iters_list[fractal_level + 1],
-                generator_type=generator_type_list[fractal_level + 1],
                 patch_size=patch_size,
                 dilation=dilation,
                 use_swin=use_swin,
@@ -146,18 +145,30 @@ class OctFractalGen(nn.Module):
         # Pass target_split for teacher forcing (revealed positions use GT
         # split embedding, masked positions use mask_token).
         target_split = targets["split"][self.fractal_level]
-        split_logits, cond_list_next, aux_loss = self.generator(
+        split_logits, cond_list_next, aux_loss, split_mask = self.generator(
             octree, cond_list, target_split
         )
 
-        # Split loss + top1 accuracy at current level
-        loss = F.cross_entropy(split_logits, target_split)
+        # Split loss + top1 accuracy at current level. For MAR training,
+        # match OctGPT/FractalGen and supervise only masked prediction nodes.
+        if split_mask is not None:
+            split_loss_logits = split_logits[split_mask]
+            split_loss_target = target_split[split_mask]
+        else:
+            split_loss_logits = split_logits
+            split_loss_target = target_split
+
+        loss = F.cross_entropy(split_loss_logits, split_loss_target)
         with torch.no_grad():
-            split_pred = split_logits.argmax(dim=-1)
-            split_acc = (split_pred == target_split).float().mean()
+            split_pred = split_loss_logits.argmax(dim=-1)
+            split_acc = (split_pred == split_loss_target).float().mean()
 
         # Recursive: next level returns (loss, metrics)
         sub_loss, sub_metrics = self.next_fractal(octree, cond_list_next, targets)
+        if isinstance(self.next_fractal, OctVQGenerator):
+            sub_metrics = dict(sub_metrics)
+            sub_loss = sub_loss * self.vq_loss_weight
+            sub_metrics["vq_loss_weighted"] = sub_loss.detach()
 
         metrics = {
             f"split_loss_l{self.fractal_level}": loss.detach(),
@@ -273,9 +284,8 @@ def octfractalgen_shapenet_vq120_b2(**kwargs):
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 120),
-        num_blocks_list=(16, 8, 4, 2),
+        num_blocks_list=(16, 8, 4, 4),
         num_heads_list=(8, 8, 4, 4),
-        generator_type_list=("mar", "mar", "mar", "mar"),
         num_iters_list=(64, 128, 128, 256),
         fractal_level=0,
         **kwargs,
@@ -294,9 +304,8 @@ def octfractalgen_shapenet_vq240_b4(**kwargs):
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 240),
-        num_blocks_list=(16, 8, 4, 4),
+        num_blocks_list=(16, 8, 4, 8),
         num_heads_list=(8, 8, 4, 8),
-        generator_type_list=("mar", "mar", "mar", "mar"),
         num_iters_list=(64, 128, 128, 256),
         fractal_level=0,
         **kwargs,
@@ -317,9 +326,8 @@ def octfractalgen_shapenet_vq384_b8(**kwargs):
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 384),
-        num_blocks_list=(16, 8, 4, 8),
+        num_blocks_list=(16, 8, 4, 16),
         num_heads_list=(8, 8, 4, 8),
-        generator_type_list=("mar", "mar", "mar", "mar"),
         num_iters_list=(64, 128, 128, 256),
         fractal_level=0,
         **kwargs,
@@ -340,9 +348,8 @@ def octfractalgen_shapenet_vq384_b16(**kwargs):
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 384),
-        num_blocks_list=(16, 8, 4, 16),
+        num_blocks_list=(16, 8, 4, 32),
         num_heads_list=(8, 8, 4, 8),
-        generator_type_list=("mar", "mar", "mar", "mar"),
         num_iters_list=(64, 128, 128, 256),
         fractal_level=0,
         **kwargs,
@@ -362,9 +369,8 @@ def octfractalgen_shapenet_vq576_b8(**kwargs):
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 576),
-        num_blocks_list=(16, 8, 4, 8),
+        num_blocks_list=(16, 8, 4, 16),
         num_heads_list=(8, 8, 4, 8),
-        generator_type_list=("mar", "mar", "mar", "mar"),
         num_iters_list=(64, 128, 128, 256),
         fractal_level=0,
         **kwargs,
@@ -384,9 +390,8 @@ def octfractalgen_shapenet_vq576_b12(**kwargs):
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 576),
-        num_blocks_list=(16, 8, 4, 12),
+        num_blocks_list=(16, 8, 4, 24),
         num_heads_list=(8, 8, 4, 8),
-        generator_type_list=("mar", "mar", "mar", "mar"),
         num_iters_list=(64, 128, 128, 256),
         fractal_level=0,
         **kwargs,
@@ -405,9 +410,21 @@ def octfractalgen_shapenet_vq576_b16(**kwargs):
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 576),
-        num_blocks_list=(16, 8, 4, 16),
+        num_blocks_list=(16, 8, 4, 32),
         num_heads_list=(8, 8, 4, 8),
-        generator_type_list=("mar", "mar", "mar", "mar"),
+        num_iters_list=(64, 128, 128, 256),
+        fractal_level=0,
+        **kwargs,
+    )
+    return model
+
+
+def octfractalgen_shapenet_vq768_b24(**kwargs):
+    model = OctFractalGen(
+        depth_list=(3, 4, 5, 6),
+        embed_dim_list=(768, 384, 240, 768),
+        num_blocks_list=(16, 8, 4, 48),
+        num_heads_list=(8, 8, 4, 8),
         num_iters_list=(64, 128, 128, 256),
         fractal_level=0,
         **kwargs,

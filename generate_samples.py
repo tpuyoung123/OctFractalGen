@@ -15,6 +15,7 @@ from models.octfractalgen import (
     octfractalgen_shapenet_vq576_b8,
     octfractalgen_shapenet_vq576_b12,
     octfractalgen_shapenet_vq576_b16,
+    octfractalgen_shapenet_vq768_b24,
 )
 from models.vae_loader import build_vqvae
 from utils import utils as octgpt_utils
@@ -178,6 +179,7 @@ def main():
     has_film = any(".film." in k for k in sd_keys)
     has_cross_attn = any(".cond_cross_attn." in k for k in sd_keys)
     model_kwargs = {}
+    model_kwargs["patch_size"] = ck_args.get("patch_size", 1024)
     model_kwargs["vq_use_bit_pos_emb"] = has_bit_pos_emb
     if has_film:
         model_kwargs["vq_cond_injection"] = "film"
@@ -189,6 +191,7 @@ def main():
         f"  Detected from state_dict: bit_pos_emb={has_bit_pos_emb}, "
         f"cond_injection={model_kwargs['vq_cond_injection']}"
     )
+    print(f"  Using patch_size={model_kwargs['patch_size']}")
 
     # ---- Model ----
     print("Building OctFractalGen ...")
@@ -204,8 +207,10 @@ def main():
         model = octfractalgen_shapenet_vq576_b8(**model_kwargs)
     elif args.model == "shapenet_vq576_b12":
         model = octfractalgen_shapenet_vq576_b12(**model_kwargs)
-    else:  # shapenet_vq576_b16
+    elif args.model == "shapenet_vq576_b16":
         model = octfractalgen_shapenet_vq576_b16(**model_kwargs)
+    else:
+        model = octfractalgen_shapenet_vq768_b24(**model_kwargs)
     model.to(device)
 
     model.load_state_dict(ck["model"])

@@ -18,8 +18,7 @@ class OctSplitGenerator(nn.Module):
         cond_embed_dim,
         num_blocks,
         num_heads,
-        generator_type="mar",
-        patch_size=1024,
+        patch_size=2048,
         dilation=2,
         use_swin=True,
         use_checkpoint=True,
@@ -29,7 +28,6 @@ class OctSplitGenerator(nn.Module):
     ):
         super().__init__()
         self.depth = depth
-        self.generator_type = generator_type
         self.patch_size = patch_size
         self.dilation = dilation
         self.use_swin = use_swin
@@ -144,10 +142,11 @@ class OctSplitGenerator(nn.Module):
             split_logits: (N_d, 2)
             cond_list_next: split feature tensors aligned to depth self.depth + 1
             aux_loss: 0.0 (no auxiliary loss)
+            mask: optional bool tensor (N_d,), True for MAR prediction targets
         """
         nnum_d = octree.nnum[self.depth]
 
-        if self.training and self.generator_type == "mar":
+        if self.training:
             # random masking for MAR training: revealed = ~mask
             mask_rate = self.mask_ratio_generator.rvs(1)[0]
             num_masked = max(int(np.ceil(nnum_d * mask_rate)), 1)
@@ -175,7 +174,7 @@ class OctSplitGenerator(nn.Module):
         cond_next = octree_copy_unpool(features, octree, self.depth, nempty=False)
         cond_list_next = cond_list_prev + [cond_next]
 
-        return split_logits, cond_list_next, 0.0
+        return split_logits, cond_list_next, 0.0, mask
 
     # ------------------------------------------------------------------
     # generation (MAR iterative sampling)

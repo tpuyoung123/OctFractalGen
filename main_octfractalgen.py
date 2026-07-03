@@ -18,6 +18,7 @@ from models.octfractalgen import (
     octfractalgen_shapenet_vq576_b8,
     octfractalgen_shapenet_vq576_b12,
     octfractalgen_shapenet_vq576_b16,
+    octfractalgen_shapenet_vq768_b24,
 )
 from models.oct_vq_gen import OctVQGenerator
 from models.vae_loader import build_vqvae
@@ -157,17 +158,12 @@ def train_one_epoch(
             elapsed = time.time() - t0
             batch_size = dataloader.batch_size
             sps = (it + 1) * batch_size / max(elapsed, 1e-6)  # samples/sec
-            mem = (
-                torch.cuda.max_memory_allocated() / 1e9
-                if torch.cuda.is_available()
-                else 0
-            )
             inst_metrics = format_focus_metrics(metrics)
             print(
                 f"  [ep {epoch}] iter {it + 1}/{len(dataloader)} | "
                 f"loss {loss.item():.4f} avg {avg:.4f} | "
                 f"{inst_metrics} | "
-                f"{sps:.2f} samples/s | mem {mem:.2f} GB | lr {cur_lr:.2e}"
+                f"{sps:.2f} samples/s| lr {cur_lr:.2e}"
             )
 
     elapsed = time.time() - t0
@@ -212,9 +208,10 @@ def main():
             "shapenet_vq576_b8",
             "shapenet_vq576_b12",
             "shapenet_vq576_b16",
+            "shapenet_vq768_b24",
         ],
-        help="Model variant. vq{dim}_b{blocks} = L3 (terminal VQ generator) "
-        "embed_dim and num_blocks, all sharing L0=768/L1=384/L2=240.",
+        help="Model variant. Split levels keep original blocks; terminal VQ "
+        "predictor uses doubled total blocks for encoder+decoder.",
     )
     parser.add_argument("--epochs", type=int, default=400)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -233,6 +230,12 @@ def main():
         type=float,
         default=3.0,
         help="Gradient clipping max norm; <=0 disables clipping",
+    )
+    parser.add_argument(
+        "--patch_size",
+        type=int,
+        default=2048,
+        help="OctFormer attention patch size. Default is doubled from 1024 to 2048.",
     )
     parser.add_argument(
         "--vq_mask_ratio_min",
@@ -287,11 +290,10 @@ def main():
         help="Number of attention heads for --vq_cond_injection cross_attn.",
     )
     parser.add_argument(
-        "--freeze_vq_epochs",
-        type=int,
-        default=0,
-        help="Two-stage training: freeze L3 OctVQGenerator for first N "
-        "epochs, then unfreeze. 0=disabled; usually keep disabled for VQAcc.",
+        "--vq_loss_weight",
+        type=float,
+        default=1.0,
+        help="Loss weight applied once to the terminal VQ prediction loss.",
     )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=2)
@@ -327,12 +329,12 @@ def main():
                     return True
         return False
 
-    # normalize legacy -1 to disabled
-    if args.freeze_vq_epochs < 0:
-        args.freeze_vq_epochs = 0
-
     if not (0.0 <= args.vq_mask_ratio_min < 1.0):
         raise ValueError("--vq_mask_ratio_min must be in [0, 1)")
+    if args.vq_loss_weight < 0.0:
+        raise ValueError("--vq_loss_weight must be >= 0")
+    if args.patch_size <= 0:
+        raise ValueError("--patch_size must be > 0")
 
     os.makedirs(args.logdir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -355,6 +357,8 @@ def main():
         vq_use_bit_pos_emb=args.vq_use_bit_pos_emb,
         vq_cond_injection=args.vq_cond_injection,
         vq_cond_cross_attn_heads=args.vq_cond_cross_attn_heads,
+        vq_loss_weight=args.vq_loss_weight,
+        patch_size=args.patch_size,
     )
     if args.model == "shapenet_vq120_b2":
         model = octfractalgen_shapenet_vq120_b2(
@@ -382,6 +386,10 @@ def main():
         )
     elif args.model == "shapenet_vq576_b16":
         model = octfractalgen_shapenet_vq576_b16(
+            **model_kwargs,
+        )
+    elif args.model == "shapenet_vq768_b24":
+        model = octfractalgen_shapenet_vq768_b24(
             **model_kwargs,
         )
     model.to(device)

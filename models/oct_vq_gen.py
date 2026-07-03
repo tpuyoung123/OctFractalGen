@@ -63,8 +63,7 @@ class OctVQGenerator(nn.Module):
         num_heads,
         vq_groups=32,
         num_iters=256,
-        generator_type="mar",
-        patch_size=1024,
+        patch_size=2048,
         dilation=2,
         use_swin=True,
         use_checkpoint=True,
@@ -107,7 +106,6 @@ class OctVQGenerator(nn.Module):
         self.vq_size = 2  # BSQ bit classification: 0/1
         self.vq_groups = vq_groups  # BSQ32 -> 32
         self.num_iters = num_iters
-        self.generator_type = generator_type
         self.patch_size = patch_size
         self.dilation = dilation
         self.use_swin = use_swin
@@ -161,10 +159,14 @@ class OctVQGenerator(nn.Module):
         # mask token for MAR (unrevealed positions)
         self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
 
-        # OctFormer backbone (windowed attention with RoPE)
-        self.transformer = OctFormer(
+        # OctGPT-style encoder-decoder backbone. The encoder only processes
+        # visible VQ tokens; the decoder then reasons over the full sequence
+        # containing both encoded visible tokens and masked tokens.
+        enc_blocks = max(num_blocks // 2, 1)
+        dec_blocks = max(num_blocks - enc_blocks, 1)
+        self.encoder = OctFormer(
             channels=embed_dim,
-            num_blocks=num_blocks,
+            num_blocks=enc_blocks,
             num_heads=num_heads,
             patch_size=patch_size,
             dilation=dilation,
@@ -177,7 +179,24 @@ class OctVQGenerator(nn.Module):
             pos_emb=SinPosEmb,
             norm_layer=nn.LayerNorm,
         )
-        self.norm = nn.LayerNorm(embed_dim)
+        self.encoder_ln = nn.LayerNorm(embed_dim)
+
+        self.decoder = OctFormer(
+            channels=embed_dim,
+            num_blocks=dec_blocks,
+            num_heads=num_heads,
+            patch_size=patch_size,
+            dilation=dilation,
+            dropout=proj_dropout,
+            attn_drop=attn_dropout,
+            proj_drop=proj_dropout,
+            nempty=False,
+            use_checkpoint=use_checkpoint,
+            use_swin=use_swin,
+            pos_emb=SinPosEmb,
+            norm_layer=nn.LayerNorm,
+        )
+        self.decoder_ln = nn.LayerNorm(embed_dim)
 
         # VQ head: 32 independent binary classifications (BSQ32)
         # output shape: (N, 2 * vq_groups) -> reshape to (N, vq_groups, 2)
@@ -228,8 +247,77 @@ class OctVQGenerator(nn.Module):
         remask[remask_indices] = True
         return remask & ~mask
 
+    def _forward_blocks(self, x, octreeT, blocks):
+        x = depth2batch(x, octreeT.indices)
+        x = blocks(x, octreeT, context=None)
+        x = batch2depth(x, octreeT.indices)
+        return x
+
+    def _forward_model(self, x, octree, mask=None):
+        nnum_d = x.shape[0]
+        if mask is not None:
+            if mask.shape[0] != nnum_d:
+                raise ValueError(
+                    f"VQ mask length must match token count: {mask.shape[0]} vs {nnum_d}"
+                )
+            mask = mask.to(device=x.device, dtype=torch.bool)
+            visible = ~mask
+        else:
+            visible = None
+
+        # Encoder: OctGPT keeps only visible tokens through data_mask. This
+        # generator has no class/buffer tokens, so the all-masked first sample
+        # step skips the encoder and lets the decoder process mask+condition.
+        if visible is None:
+            x_enc = x
+            octreeT_encoder = OctreeT(
+                octree,
+                x_enc.shape[0],
+                self.patch_size,
+                self.dilation,
+                nempty=False,
+                depth_list=[self.depth],
+                buffer_size=0,
+                use_swin=self.use_swin,
+            )
+            x_enc = self._forward_blocks(x_enc, octreeT_encoder, self.encoder)
+            x = self.encoder_ln(x_enc)
+        elif visible.any():
+            x_enc = x[visible]
+            octreeT_encoder = OctreeT(
+                octree,
+                x_enc.shape[0],
+                self.patch_size,
+                self.dilation,
+                nempty=False,
+                depth_list=[self.depth],
+                data_mask=mask,
+                buffer_size=0,
+                use_swin=self.use_swin,
+            )
+            x_enc = self._forward_blocks(x_enc, octreeT_encoder, self.encoder)
+            x_enc = self.encoder_ln(x_enc)
+            x = x.clone()
+            x[visible] = x_enc
+
+        # Decoder: full sequence, with visible tokens already encoded and
+        # masked tokens still carrying mask+condition embeddings.
+        octreeT_decoder = OctreeT(
+            octree,
+            nnum_d,
+            self.patch_size,
+            self.dilation,
+            nempty=False,
+            depth_list=[self.depth],
+            buffer_size=0,
+            use_swin=self.use_swin,
+        )
+        x = self._forward_blocks(x, octreeT_decoder, self.decoder)
+        x = self.decoder_ln(x)
+        return x
+
     # ------------------------------------------------------------------
-    # shared encoder
+    # shared encoder-decoder predictor
     # ------------------------------------------------------------------
     def _encode(self, octree, vq_codes, cond_list, mask=None):
         """Encode nodes at self.depth.
@@ -314,26 +402,7 @@ class OctVQGenerator(nn.Module):
             )
             x = x_attn.squeeze(0)
 
-        # Build OctreeT for windowed attention at this depth
-        nnum_d = x.shape[0]
-        octreeT = OctreeT(
-            octree,
-            nnum_d,
-            self.patch_size,
-            self.dilation,
-            nempty=False,
-            depth_list=[self.depth],
-            buffer_size=0,
-            use_swin=self.use_swin,
-        )
-
-        # depth layout -> batch layout -> OctFormer -> batch -> depth layout
-        x = depth2batch(x, octreeT.indices)
-        x = self.transformer(x, octreeT, context=None)
-        x = batch2depth(x, octreeT.indices)
-
-        x = self.norm(x)
-        return x
+        return self._forward_model(x, octree, mask)
 
     # ------------------------------------------------------------------
     # training forward (teacher forcing) — called as next_fractal(octree, cond_list, targets)
@@ -368,7 +437,7 @@ class OctVQGenerator(nn.Module):
             input_vq = torch.where(flip, 1 - target_vq, target_vq)
             input_vq_code = self._bsq_indices_to_code(input_vq).to(octree.device)
 
-        if self.training and self.generator_type == "mar":
+        if self.training:
             mask_rate = self.mask_ratio_generator.rvs(1)[0]
             num_masked = max(int(np.ceil(nnum_d * mask_rate)), 1)
             orders = torch.randperm(nnum_d, device=octree.device)
