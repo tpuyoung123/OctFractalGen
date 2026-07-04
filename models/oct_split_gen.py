@@ -187,7 +187,6 @@ class OctSplitGenerator(nn.Module):
         num_iter,
         temperature,
         next_level_sample_function,
-        visualize=False,
     ):
         """Generation: MAR sample split -> grow octree -> recurse.
 

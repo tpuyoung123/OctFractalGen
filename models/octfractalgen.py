@@ -32,6 +32,7 @@ class OctFractalGen(nn.Module):
         vq_cond_injection="film",
         vq_cond_cross_attn_heads=4,
         vq_loss_weight=1.0,
+        vq_buffer_size=64,
         fractal_level=0,
     ):
         super().__init__()
@@ -93,6 +94,7 @@ class OctFractalGen(nn.Module):
                 vq_cond_injection=vq_cond_injection,
                 vq_cond_cross_attn_heads=vq_cond_cross_attn_heads,
                 vq_loss_weight=vq_loss_weight,
+                vq_buffer_size=vq_buffer_size,
                 fractal_level=fractal_level + 1,
             )
         else:
@@ -106,6 +108,7 @@ class OctFractalGen(nn.Module):
                 num_heads=num_heads_list[fractal_level + 1],
                 num_iters=num_iters_list[fractal_level + 1],
                 patch_size=patch_size,
+                buffer_size=vq_buffer_size,
                 dilation=dilation,
                 use_swin=use_swin,
                 use_checkpoint=use_checkpoint,
@@ -185,7 +188,6 @@ class OctFractalGen(nn.Module):
         num_iter_list=None,
         temperature=1.0,
         fractal_level=0,
-        visualize=False,
         return_raw_octree=False,
     ):
         """
@@ -260,7 +262,6 @@ class OctFractalGen(nn.Module):
             num_iter_list[fractal_level],
             cur_temperature,
             next_level_sample_function,
-            visualize,
         )
 
 
@@ -270,17 +271,6 @@ class OctFractalGen(nn.Module):
 
 
 def octfractalgen_shapenet_vq120_b2(**kwargs):
-    """OctFractalGen for ShapeNet airplane (unconditional, depth 3->6).
-
-    4 fractal levels. Embed dims chosen so that (dim // heads) % 6 == 0,
-    which is required by OctFormer's RotaryPosEmb (init_3d_freqs produces
-    3 * (dim//heads//6) freqs, must equal (dim//heads)//2).
-      Level 0 (d=3): OctSplitGenerator, 768 dim, 16 blocks (768/8=96, 96%6=0)
-      Level 1 (d=4): OctSplitGenerator, 384 dim,  8 blocks (384/8=48, 48%6=0)
-      Level 2 (d=5): OctSplitGenerator, 240 dim,  4 blocks (240/4=60, 60%6=0)
-      Level 3 (d=6): OctVQGenerator,   120 dim,  2 blocks (120/4=30, 30%6=0) (BSQ32)
-    L0 aligns with OctGPT (768 dim). Total ~132M params.
-    """
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 120),
@@ -294,13 +284,6 @@ def octfractalgen_shapenet_vq120_b2(**kwargs):
 
 
 def octfractalgen_shapenet_vq240_b4(**kwargs):
-    """ShapeNet variant with a stronger terminal VQ predictor.
-
-    Keeps the coarse split hierarchy unchanged, but increases the depth-6 VQ
-    generator from 120 dim / 2 blocks to 240 dim / 4 blocks. This uses the
-    extra memory headroom to improve BSQ32 prediction without changing the
-    target VQVAE code format.
-    """
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 240),
@@ -314,15 +297,6 @@ def octfractalgen_shapenet_vq240_b4(**kwargs):
 
 
 def octfractalgen_shapenet_vq384_b8(**kwargs):
-    """ShapeNet variant with an aggressive terminal VQ predictor.
-
-    L3 (depth=6 VQ generator) is enlarged to 384 dim / 8 blocks (~5.6M params,
-    ~16x larger than the baseline 120 dim / 2 blocks). This is the
-    cost-effective sweet spot for BSQ32 prediction: expected vq_top5_acc
-    ~0.88-0.92, approaching OctGPT's 0.90+ without exploding total params.
-
-    RoPE-compatible: 384 / 8 = 48, 48 % 6 == 0.
-    """
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 384),
@@ -336,15 +310,6 @@ def octfractalgen_shapenet_vq384_b8(**kwargs):
 
 
 def octfractalgen_shapenet_vq384_b16(**kwargs):
-    """ShapeNet variant with maximum terminal VQ predictor capacity.
-
-    L3 (depth=6 VQ generator) is enlarged to 384 dim / 16 blocks (~11M params,
-    ~32x larger than the baseline 120 dim / 2 blocks). With this capacity,
-    L3 approaches OctGPT's per-block depth (OctGPT uses 24 blocks total
-    split as 12 enc + 12 dec). Expected vq_top5_acc ~0.92+, matching OctGPT.
-
-    Total params ~144M. RoPE-compatible: 384 / 8 = 48, 48 % 6 == 0.
-    """
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 384),
@@ -358,14 +323,6 @@ def octfractalgen_shapenet_vq384_b16(**kwargs):
 
 
 def octfractalgen_shapenet_vq576_b8(**kwargs):
-    """ShapeNet variant with a wider terminal VQ predictor.
-
-    L3 (depth=6 VQ generator) is enlarged to 576 dim / 8 blocks while keeping
-    the coarse split hierarchy unchanged. This is a wider alternative to
-    vq384_b8 for improving BSQ32 bit interactions.
-
-    RoPE-compatible: 576 / 8 = 72, 72 % 6 == 0.
-    """
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 576),
@@ -379,14 +336,6 @@ def octfractalgen_shapenet_vq576_b8(**kwargs):
 
 
 def octfractalgen_shapenet_vq576_b12(**kwargs):
-    """Recommended high-capacity ShapeNet terminal VQ predictor.
-
-    L3 (depth=6 VQ generator) is enlarged to 576 dim / 12 blocks. This raises
-    both width and depth over the vq384 variants while staying compatible with
-    the current OctFormer RoPE constraints.
-
-    RoPE-compatible: 576 / 8 = 72, 72 % 6 == 0.
-    """
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 576),
@@ -400,13 +349,6 @@ def octfractalgen_shapenet_vq576_b12(**kwargs):
 
 
 def octfractalgen_shapenet_vq576_b16(**kwargs):
-    """Maximum high-capacity ShapeNet terminal VQ predictor.
-
-    L3 (depth=6 VQ generator) is enlarged to 576 dim / 16 blocks. Use this
-    when VQ accuracy is the priority and batch size can be reduced if needed.
-
-    RoPE-compatible: 576 / 8 = 72, 72 % 6 == 0.
-    """
     model = OctFractalGen(
         depth_list=(3, 4, 5, 6),
         embed_dim_list=(768, 384, 240, 576),

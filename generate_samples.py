@@ -116,6 +116,7 @@ def main():
             "shapenet_vq576_b8",
             "shapenet_vq576_b12",
             "shapenet_vq576_b16",
+            "shapenet_vq768_b24",
         ],
     )
     parser.add_argument("--num_samples", type=int, default=8)
@@ -180,6 +181,7 @@ def main():
     has_cross_attn = any(".cond_cross_attn." in k for k in sd_keys)
     model_kwargs = {}
     model_kwargs["patch_size"] = ck_args.get("patch_size", 1024)
+    model_kwargs["vq_buffer_size"] = ck_args.get("vq_buffer_size", 0)
     model_kwargs["vq_use_bit_pos_emb"] = has_bit_pos_emb
     if has_film:
         model_kwargs["vq_cond_injection"] = "film"
@@ -192,6 +194,7 @@ def main():
         f"cond_injection={model_kwargs['vq_cond_injection']}"
     )
     print(f"  Using patch_size={model_kwargs['patch_size']}")
+    print(f"  Using vq_buffer_size={model_kwargs['vq_buffer_size']}")
 
     # ---- Model ----
     print("Building OctFractalGen ...")

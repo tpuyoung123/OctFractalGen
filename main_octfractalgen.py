@@ -262,13 +262,6 @@ def main():
         help="Fraction of low-confidence VQ positions to remask during sampling",
     )
     parser.add_argument(
-        "--p0",
-        action="store_true",
-        default=False,
-        help="Enable P1/P2 architectural enhancements: bit_pos_emb + FiLM "
-        "condition injection. Loss follows OctGPT convention (plain masked CE).",
-    )
-    parser.add_argument(
         "--vq_use_bit_pos_emb",
         action="store_true",
         default=False,
@@ -295,8 +288,14 @@ def main():
         default=1.0,
         help="Loss weight applied once to the terminal VQ prediction loss.",
     )
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument(
+        "--vq_buffer_size",
+        type=int,
+        default=64,
+        help="Number of OctGPT-style visible condition buffer tokens per batch item for VQ prediction.",
+    )
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--num_workers", type=int, default=16)
     parser.add_argument("--depth", type=int, default=8)
     parser.add_argument("--full_depth", type=int, default=3)
     parser.add_argument(
@@ -322,17 +321,12 @@ def main():
     parser.add_argument("--log_interval", type=int, default=20)
     args = parser.parse_args()
 
-    def cli_has_option(*option_names):
-        for arg in sys.argv[1:]:
-            for name in option_names:
-                if arg == name or arg.startswith(name + "="):
-                    return True
-        return False
-
     if not (0.0 <= args.vq_mask_ratio_min < 1.0):
         raise ValueError("--vq_mask_ratio_min must be in [0, 1)")
     if args.vq_loss_weight < 0.0:
         raise ValueError("--vq_loss_weight must be >= 0")
+    if args.vq_buffer_size < 0:
+        raise ValueError("--vq_buffer_size must be >= 0")
     if args.patch_size <= 0:
         raise ValueError("--patch_size must be > 0")
 
@@ -358,6 +352,7 @@ def main():
         vq_cond_injection=args.vq_cond_injection,
         vq_cond_cross_attn_heads=args.vq_cond_cross_attn_heads,
         vq_loss_weight=args.vq_loss_weight,
+        vq_buffer_size=args.vq_buffer_size,
         patch_size=args.patch_size,
     )
     if args.model == "shapenet_vq120_b2":

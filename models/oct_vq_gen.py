@@ -64,6 +64,7 @@ class OctVQGenerator(nn.Module):
         vq_groups=32,
         num_iters=256,
         patch_size=2048,
+        buffer_size=64,
         dilation=2,
         use_swin=True,
         use_checkpoint=True,
@@ -107,6 +108,9 @@ class OctVQGenerator(nn.Module):
         self.vq_groups = vq_groups  # BSQ32 -> 32
         self.num_iters = num_iters
         self.patch_size = patch_size
+        if buffer_size < 0:
+            raise ValueError("buffer_size must be >= 0")
+        self.buffer_size = int(buffer_size)
         self.dilation = dilation
         self.use_swin = use_swin
         self.random_flip = random_flip
@@ -253,7 +257,39 @@ class OctVQGenerator(nn.Module):
         x = batch2depth(x, octreeT.indices)
         return x
 
-    def _forward_model(self, x, octree, mask=None):
+    def add_buffer(self, x, mask, octree, cond):
+        if self.buffer_size == 0:
+            return x, mask
+
+        batch_id = octree.batch_id(self.depth).to(device=x.device, dtype=torch.long)
+        if batch_id.shape[0] != x.shape[0]:
+            raise ValueError(
+                "VQ buffer batch_id length must match token count: "
+                f"{batch_id.shape[0]} vs {x.shape[0]}"
+            )
+        if cond is None:
+            cond = x
+        if cond.shape != x.shape:
+            raise ValueError(
+                f"VQ buffer condition shape must match token shape: {cond.shape} vs {x.shape}"
+            )
+
+        batch_size = octree.batch_size
+        pooled = x.new_zeros(batch_size, x.shape[-1])
+        pooled.index_add_(0, batch_id, cond.to(dtype=x.dtype))
+        counts = torch.bincount(batch_id, minlength=batch_size).to(
+            device=x.device, dtype=x.dtype
+        )
+        pooled = pooled / counts.clamp_min(1.0).unsqueeze(1)
+
+        buffer = pooled.unsqueeze(1).expand(-1, self.buffer_size, -1)
+        buffer = buffer.reshape(-1, x.shape[-1])
+        mask_buffer = torch.zeros(buffer.shape[0], dtype=torch.bool, device=x.device)
+        x = torch.cat([buffer, x], dim=0)
+        mask = torch.cat([mask_buffer, mask], dim=0)
+        return x, mask
+
+    def _forward_model(self, x, octree, mask=None, buffer_cond=None):
         nnum_d = x.shape[0]
         if mask is not None:
             if mask.shape[0] != nnum_d:
@@ -261,28 +297,17 @@ class OctVQGenerator(nn.Module):
                     f"VQ mask length must match token count: {mask.shape[0]} vs {nnum_d}"
                 )
             mask = mask.to(device=x.device, dtype=torch.bool)
-            visible = ~mask
         else:
-            visible = None
+            mask = torch.zeros(nnum_d, dtype=torch.bool, device=x.device)
+
+        x, mask = self.add_buffer(x, mask, octree, buffer_cond)
+        buffer_tokens = octree.batch_size * self.buffer_size
+        visible = ~mask
 
         # Encoder: OctGPT keeps only visible tokens through data_mask. This
-        # generator has no class/buffer tokens, so the all-masked first sample
-        # step skips the encoder and lets the decoder process mask+condition.
-        if visible is None:
-            x_enc = x
-            octreeT_encoder = OctreeT(
-                octree,
-                x_enc.shape[0],
-                self.patch_size,
-                self.dilation,
-                nempty=False,
-                depth_list=[self.depth],
-                buffer_size=0,
-                use_swin=self.use_swin,
-            )
-            x_enc = self._forward_blocks(x_enc, octreeT_encoder, self.encoder)
-            x = self.encoder_ln(x_enc)
-        elif visible.any():
+        # includes always-visible buffer tokens, so the first fully-masked
+        # sample step still has conditioning context in the encoder.
+        if visible.any():
             x_enc = x[visible]
             octreeT_encoder = OctreeT(
                 octree,
@@ -292,28 +317,32 @@ class OctVQGenerator(nn.Module):
                 nempty=False,
                 depth_list=[self.depth],
                 data_mask=mask,
-                buffer_size=0,
+                buffer_size=self.buffer_size,
                 use_swin=self.use_swin,
             )
             x_enc = self._forward_blocks(x_enc, octreeT_encoder, self.encoder)
             x_enc = self.encoder_ln(x_enc)
             x = x.clone()
-            x[visible] = x_enc
+            x[visible] = x_enc.to(dtype=x.dtype)
 
-        # Decoder: full sequence, with visible tokens already encoded and
-        # masked tokens still carrying mask+condition embeddings.
+        # Decoder: full sequence (buffer + tokens), with visible tokens
+        # already encoded and masked tokens still carrying mask+condition
+        # embeddings. data_length must include buffer tokens to match
+        # x.shape[0] for patch_partition's assert.
         octreeT_decoder = OctreeT(
             octree,
-            nnum_d,
+            x.shape[0],
             self.patch_size,
             self.dilation,
             nempty=False,
             depth_list=[self.depth],
-            buffer_size=0,
+            buffer_size=self.buffer_size,
             use_swin=self.use_swin,
         )
         x = self._forward_blocks(x, octreeT_decoder, self.decoder)
         x = self.decoder_ln(x)
+        if buffer_tokens > 0:
+            x = x[buffer_tokens:]
         return x
 
     # ------------------------------------------------------------------
@@ -402,7 +431,7 @@ class OctVQGenerator(nn.Module):
             )
             x = x_attn.squeeze(0)
 
-        return self._forward_model(x, octree, mask)
+        return self._forward_model(x, octree, mask, cond)
 
     # ------------------------------------------------------------------
     # training forward (teacher forcing) — called as next_fractal(octree, cond_list, targets)
@@ -492,7 +521,6 @@ class OctVQGenerator(nn.Module):
         vqvae,
         num_iter=None,
         temperature=0.5,
-        visualize=False,
         return_raw_octree=False,
     ):
         """Generation: MAR sample VQ codes -> VQVAE decode -> neural_mpu.
@@ -540,7 +568,7 @@ class OctVQGenerator(nn.Module):
 
             mask = mask_next
 
-            # OctGPT-style remask: revisit low-confidence revealed VQ codes.
+            # remask: revisit low-confidence revealed VQ codes.
             if step > num_iter * self.remask_stage and self.remask_prob > 0.0:
                 remask = self._get_remask(
                     vq_logits, vq_pred, mask, topk=5, remask_prob=self.remask_prob
