@@ -22,6 +22,8 @@ conda create -n octfractalgen python=3.12
 pip install -r requirements.txt
 ```
 
+---
+
 ### 2. 下载数据与模型
 
 从[这里](https://disk.pku.edu.cn/link/AA168CB1A3463E4828BFE18DCA781A496B)下载预训练模型
@@ -49,9 +51,9 @@ python main_octfractalgen.py \
   --grad_clip 3.0 \
   --patch_size 2048 \
   --vq_mask_ratio_min 0.5 \
-  --vq_random_flip: 0.1 \
+  --vq_random_flip 0.1 \
   --vq_remask_stage 0.7 \
-  --vq_remask_prob: 0.1 \
+  --vq_remask_prob 0.1 \
   --vq_use_bit_pos_emb \
   --vq_cond_injection film \
   --vq_cond_cross_attn_heads 4 \
